@@ -1,377 +1,437 @@
 import streamlit as st
-from datetime import date, datetime
+from datetime import date
 from io import BytesIO
-from math import exp
-from statistics import mean, median
-
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
-
-try:
-    from PIL import Image
-except Exception:
-    Image = None
 
 AGENCE = "LA PRIORITE IMMOBILIERE"
 EMAIL = "sbelhmira@gmail.com"
-LOGO_PATH = "assets/logo.png"
 
+# -----------------------------
+# 1) Grille / Referentiel (modifiable par toi)
+# -----------------------------
+DEFAULT_ZONES = [
+    # Zone, Type, Base €/m² habitable, Terrain €/m² (maisons), Commerce €/m² (si méthode €/m²)
+    {"zone": "Namur - Centre", "type": "Maison", "base_eur_m2": 2150, "terrain_eur_m2": 20, "commerce_eur_m2": 0},
+    {"zone": "Namur - Centre", "type": "Appartement", "base_eur_m2": 2350, "terrain_eur_m2": 0, "commerce_eur_m2": 0},
+    {"zone": "Charleroi", "type": "Maison", "base_eur_m2": 1550, "terrain_eur_m2": 12, "commerce_eur_m2": 0},
+    {"zone": "Charleroi", "type": "Appartement", "base_eur_m2": 1700, "terrain_eur_m2": 0, "commerce_eur_m2": 0},
+    {"zone": "Liege - Axe commercial", "type": "Commerce", "base_eur_m2": 0, "terrain_eur_m2": 0, "commerce_eur_m2": 2400},
+]
 
+DEFAULT_PARAMS = {
+    # Ajustements PEB (en %)
+    "peb_A": +0.06,
+    "peb_B": +0.03,
+    "peb_C":  0.00,
+    "peb_D": -0.03,
+    "peb_E": -0.06,
+    "peb_F": -0.09,
+    "peb_G": -0.12,
+
+    # Ajustements état (en %)
+    "etat_renove": +0.08,
+    "etat_bon": +0.03,
+    "etat_rafraichir": -0.03,
+    "etat_renover": -0.10,
+
+    # Annexes (valeurs fixes)
+    "garage": 15000,
+    "parking": 8000,
+    "terrasse": 4000,
+    "jardin": 6000,
+    "cave": 2000,
+
+    # Dégressivité surface (expert)
+    # au-dessus de 160 m²: baisse le €/m² de 6%
+    "seuil_degressif_m2": 160,
+    "degressif_pct": 0.06,
+
+    # Fourchette (+/-)
+    "fourchette_pct": 0.06,
+}
+
+# -----------------------------
+# Helpers
+# -----------------------------
 def euro(x: float) -> str:
-    s = f"{x:,.0f}".replace(",", " ")
-    return f"{s} EUR"
+    return f"{x:,.0f} €".replace(",", " ")
 
+def get_peb_adj(params: dict, peb: str) -> float:
+    peb = (peb or "").strip().upper()
+    return params.get(f"peb_{peb}", 0.0)
 
-def pm2(x: float) -> str:
-    s = f"{x:,.0f}".replace(",", " ")
-    return f"{s} EUR/m2"
-
-
-def weight(distance_km: float, days_old: int, surf_comp: float, surf_bien: float) -> float:
-    distance_km = max(distance_km, 0.1)
-    days_old = max(days_old, 1)
-    ratio = surf_bien / max(surf_comp, 1.0)
-    sim = exp(-abs(1.0 - ratio) * 2.0)
-    wd = exp(-distance_km * 0.9)
-    wr = exp(-(days_old / 365.0) * 1.3)
-    return max(0.0001, sim * wd * wr)
-
-
-def adj_factor(epc: str, etat: str, params: dict) -> float:
-    epc = (epc or "").strip().upper()
-    f = params.get(f"epc_{epc}", 0.0)
-    etat_key = {
+def get_etat_adj(params: dict, etat: str) -> float:
+    key = {
         "Renove": "etat_renove",
         "Bon": "etat_bon",
         "A rafraichir": "etat_rafraichir",
         "A renover": "etat_renover",
     }.get(etat, "etat_bon")
-    f += params.get(etat_key, 0.0)
-    return f
+    return params.get(key, 0.0)
 
+def apply_degressivity(base_eur_m2: float, surface: float, params: dict) -> float:
+    seuil = params["seuil_degressif_m2"]
+    if surface > seuil:
+        return base_eur_m2 * (1.0 - params["degressif_pct"])
+    return base_eur_m2
 
-def estimate(bien: dict, comps: list[dict], params: dict):
-    if len(comps) < 3:
-        return None
+def estimate_residentiel(zone_row: dict, bien: dict, params: dict) -> dict:
+    base_m2 = apply_degressivity(zone_row["base_eur_m2"], bien["surface"], params)
 
-    today = date.today()
-    num = 0.0
-    den = 0.0
+    # Ajustements en %
+    adj_pct = get_peb_adj(params, bien["peb"]) + get_etat_adj(params, bien["etat"])
 
-    adj_bien = adj_factor(bien["epc"], bien["etat"], params)
+    valeur_batie = bien["surface"] * base_m2 * (1.0 + adj_pct)
 
-    for c in comps:
-        pm2_raw = c["prix"] / max(c["surface"], 1.0)
-        d_vente = datetime.strptime(c["date_vente"], "%Y-%m-%d").date()
-        days_old = (today - d_vente).days
+    valeur_terrain = 0.0
+    if bien["type"] == "Maison":
+        valeur_terrain = bien["terrain"] * zone_row["terrain_eur_m2"]
 
-        adj_comp = adj_factor(c["epc"], c["etat"], params)
-        pm2_adj = pm2_raw * (1.0 + (adj_bien - adj_comp))
+    annexes = 0.0
+    annexes += params["garage"] if bien["garage"] else 0.0
+    annexes += params["parking"] if bien["parking"] else 0.0
+    annexes += params["terrasse"] if bien["terrasse"] else 0.0
+    annexes += params["jardin"] if bien["jardin"] else 0.0
+    annexes += params["cave"] if bien["cave"] else 0.0
 
-        w = weight(c["distance_km"], days_old, c["surface"], bien["surface"])
-        num += pm2_adj * w
-        den += w
-
-    base_pm2 = num / max(den, 1e-9)
-    valeur_base = base_pm2 * bien["surface"]
-
-    adj_terrain = bien["terrain"] * params["terrain_eur_m2"]
-    adj_garage = params["garage_valeur"] if bien["garage"] else 0.0
-
-    valeur = valeur_base + adj_terrain + adj_garage
+    valeur = valeur_batie + valeur_terrain + annexes
 
     pct = params["fourchette_pct"]
-    low = valeur * (1.0 - pct)
-    high = valeur * (1.0 + pct)
-
     return {
-        "pm2_estime": base_pm2,
-        "valeur_base": valeur_base,
-        "adj_terrain": adj_terrain,
-        "adj_garage": adj_garage,
         "valeur": valeur,
-        "low": low,
-        "high": high,
+        "low": valeur * (1.0 - pct),
+        "high": valeur * (1.0 + pct),
+        "detail": {
+            "base_eur_m2": base_m2,
+            "adj_pct_total": adj_pct,
+            "valeur_batie": valeur_batie,
+            "valeur_terrain": valeur_terrain,
+            "annexes": annexes,
+        }
     }
 
+def estimate_commerce(zone_row: dict, bien: dict, params: dict) -> dict:
+    # Deux méthodes : €/m² commercial OU rendement
+    methode = bien["methode_commerce"]
 
-def draw_header(c: canvas.Canvas, title: str, subtitle: str):
-    w, h = A4
+    if methode == "Rendement":
+        # Valeur = loyer annuel / taux
+        loyer_annuel = bien["loyer_mensuel"] * 12.0
+        taux = max(bien["taux_rendement"] / 100.0, 0.01)
+        valeur = loyer_annuel / taux
+        detail = {
+            "methode": "Rendement",
+            "loyer_annuel": loyer_annuel,
+            "taux": taux,
+        }
+    else:
+        # Valeur = surface commerciale * €/m² commerce (zone)
+        base = zone_row["commerce_eur_m2"]
+        valeur = bien["surface"] * base
+        detail = {
+            "methode": "€/m² commercial",
+            "commerce_eur_m2": base,
+        }
 
-    # Logo
-    try:
-        if Image is not None:
-            img = Image.open(LOGO_PATH)
-            c.drawImage(ImageReader(img), 40, h - 120, width=140, height=80, mask="auto")
-    except Exception:
-        pass
+    pct = params["fourchette_pct"]
+    return {
+        "valeur": valeur,
+        "low": valeur * (1.0 - pct),
+        "high": valeur * (1.0 + pct),
+        "detail": detail
+    }
 
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(200, h - 55, title)
-    c.setFont("Helvetica", 10)
-    c.drawString(200, h - 72, AGENCE)
-    c.drawString(200, h - 86, f"Contact: {EMAIL}")
-    c.drawString(200, h - 100, f"Date: {date.today().strftime('%d/%m/%Y')}")
-    c.setFont("Helvetica-Oblique", 9)
-    c.drawString(200, h - 114, subtitle)
-    c.line(40, h - 130, w - 40, h - 130)
-
-
-def build_pdf_3pages(bien: dict, comps: list[dict], result: dict, params: dict) -> bytes:
+def make_pdf_3pages(bien: dict, zone_row: dict, res: dict, params: dict) -> bytes:
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     w, h = A4
 
-    # PAGE 1 - Couverture / Synthese
-    draw_header(c, "Rapport d'estimation - Vente", "Synthese vendeur (page 1/3)")
-    y = h - 165
+    def header(title, subtitle):
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(40, h - 50, title)
+        c.setFont("Helvetica", 10)
+        c.drawString(40, h - 68, AGENCE)
+        c.drawString(40, h - 82, f"Contact: {EMAIL}")
+        c.drawString(40, h - 96, f"Date: {date.today().strftime('%d/%m/%Y')}")
+        c.setFont("Helvetica-Oblique", 9)
+        c.drawString(40, h - 112, subtitle)
+        c.line(40, h - 125, w - 40, h - 125)
+
+    # Page 1 : synthèse
+    header("Rapport d'estimation - Vente", "Synthese (page 1/3)")
+    y = h - 155
 
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(40, y, "Bien estime")
+    c.drawString(40, y, "Bien")
     y -= 18
     c.setFont("Helvetica", 10)
-
-    info = [
-        f"Commune: {bien['commune']}",
-        f"Type: {bien['type_bien']}",
-        f"Surface habitable: {bien['surface']:.0f} m2",
-        f"Terrain: {bien['terrain']:.0f} m2",
-        f"Etat: {bien['etat']}",
-        f"EPC: {bien['epc']}",
-        f"Garage/Parking: {'Oui' if bien['garage'] else 'Non'}",
-        f"Remarques: {bien['remarques'] or '-'}",
+    lines = [
+        f"Zone referentiel: {zone_row['zone']}  |  Type: {bien['type']}",
+        f"Adresse/Commune: {bien['commune']}",
+        f"Surface: {bien['surface']:.0f} m2",
     ]
-    for ln in info:
+    if bien["type"] == "Maison":
+        lines.append(f"Terrain: {bien['terrain']:.0f} m2")
+    if bien["type"] in ["Maison", "Appartement"]:
+        lines.append(f"Etat: {bien['etat']}  |  PEB: {bien['peb']}")
+    if bien["type"] == "Commerce":
+        lines.append(f"Methode commerce: {bien['methode_commerce']}")
+
+    for ln in lines:
         c.drawString(55, y, ln)
         y -= 14
 
     y -= 8
-    c.setFont("Helvetica-Bold", 13)
-    c.drawString(40, y, "Resultat")
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(40, y, "Estimation")
     y -= 22
     c.setFont("Helvetica-Bold", 18)
-    c.drawString(55, y, f"Prix conseille: {euro(result['valeur'])}")
+    c.drawString(55, y, f"Prix conseille: {euro(res['valeur'])}")
     y -= 22
     c.setFont("Helvetica", 11)
-    c.drawString(55, y, f"Fourchette: {euro(result['low'])}  ->  {euro(result['high'])}")
-    y -= 16
-    c.drawString(55, y, f"Reference: {pm2(result['pm2_estime'])}")
-    y -= 22
-
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(40, y, "Points cles")
-    y -= 18
-    c.setFont("Helvetica", 10)
-    bullets = [
-        "Estimation basee sur comparables ponderes (distance, recence, surface).",
-        "Ajustements EPC/etat appliques par difference entre bien et comparables.",
-        "Fourchette recommandee pour tenir compte de la negociation.",
-        "Conseil: positionner le prix selon l'objectif (vente rapide vs optimisation).",
-    ]
-    for b in bullets:
-        c.drawString(55, y, f"- {b}")
-        y -= 14
-
-    c.setFont("Helvetica-Oblique", 8)
-    c.drawString(40, 40, "Document indicatif - base sur les informations communiquees et les comparables fournis.")
-    c.showPage()
-
-    # PAGE 2 - Analyse / details ajustements
-    draw_header(c, "Analyse & justification", "Methode et ajustements (page 2/3)")
-    y = h - 165
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(40, y, "Methode")
-    y -= 18
-    c.setFont("Helvetica", 10)
-    method = [
-        "1) Selection de comparables proches et recents.",
-        "2) Calcul du prix au m2 de chaque comparable.",
-        "3) Ponderation: distance + recence + similarite surface.",
-        "4) Ajustements EPC/etat + ajustements fixes (terrain/garage).",
-    ]
-    for ln in method:
-        c.drawString(55, y, ln)
-        y -= 14
-
-    y -= 10
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(40, y, "Detail des ajustements")
-    y -= 18
-    c.setFont("Helvetica", 10)
-    c.drawString(55, y, f"Valeur base (comparables): {euro(result['valeur_base'])}")
-    y -= 14
-    c.drawString(55, y, f"Ajustement terrain ({params['terrain_eur_m2']:.0f} EUR/m2): {euro(result['adj_terrain'])}")
-    y -= 14
-    c.drawString(55, y, f"Ajustement garage/parking: {euro(result['adj_garage'])}")
-    y -= 14
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(55, y, f"Prix conseille total: {euro(result['valeur'])}")
-    y -= 14
-    c.setFont("Helvetica", 10)
-    c.drawString(55, y, f"Fourchette (+/- {int(params['fourchette_pct']*100)}%): {euro(result['low'])} -> {euro(result['high'])}")
+    c.drawString(55, y, f"Fourchette: {euro(res['low'])} -> {euro(res['high'])}")
 
     y -= 24
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(40, y, "Conseils de positionnement")
+    c.drawString(40, y, "Conclusion")
     y -= 18
     c.setFont("Helvetica", 10)
-    tips = [
-        "Vente rapide: viser le bas de la fourchette pour augmenter les demandes.",
-        "Optimisation prix: viser le prix conseille avec marge de negociation.",
-        "Si peu de contacts: revoir le prix ou l'annonce apres 2 semaines.",
-    ]
-    for t in tips:
-        c.drawString(55, y, f"- {t}")
-        y -= 14
+    c.drawString(55, y, "Estimation basee sur referentiel interne + ajustements techniques (mode expert).")
 
-    c.setFont("Helvetica-Oblique", 8)
-    c.drawString(40, 40, "Les coefficients sont ajustables selon la realite du marche local.")
     c.showPage()
 
-    # PAGE 3 - Comparables
-    draw_header(c, "Comparables", "Liste & stats (page 3/3)")
-    y = h - 165
+    # Page 2 : détails calculs
+    header("Detail des calculs", "Calculs (page 2/3)")
+    y = h - 155
 
-    pm2_list = [(cc["prix"] / max(cc["surface"], 1.0)) for cc in comps]
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(40, y, "Statistiques (EUR/m2 non ajuste)")
+    c.drawString(40, y, "Base et ajustements")
     y -= 18
     c.setFont("Helvetica", 10)
-    c.drawString(55, y, f"Moyenne: {pm2(mean(pm2_list))}")
-    c.drawString(260, y, f"Mediane: {pm2(median(pm2_list))}")
+
+    if bien["type"] in ["Maison", "Appartement"]:
+        d = res["detail"]
+        c.drawString(55, y, f"Base zone/type: {euro(d['base_eur_m2'])} par m2")
+        y -= 14
+        c.drawString(55, y, f"Ajustement total (PEB + etat): {d['adj_pct_total']*100:.1f}%")
+        y -= 14
+        c.drawString(55, y, f"Valeur batie: {euro(d['valeur_batie'])}")
+        y -= 14
+        if bien["type"] == "Maison":
+            c.drawString(55, y, f"Valeur terrain ({euro(zone_row['terrain_eur_m2'])} par m2): {euro(d['valeur_terrain'])}")
+            y -= 14
+        c.drawString(55, y, f"Annexes: {euro(d['annexes'])}")
+        y -= 14
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(55, y, f"Total: {euro(res['valeur'])}")
+    else:
+        d = res["detail"]
+        c.drawString(55, y, f"Methode: {d['methode']}")
+        y -= 14
+        if d["methode"] == "Rendement":
+            c.drawString(55, y, f"Loyer annuel: {euro(d['loyer_annuel'])}")
+            y -= 14
+            c.drawString(55, y, f"Taux rendement: {d['taux']*100:.2f}%")
+            y -= 14
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(55, y, f"Valeur: {euro(res['valeur'])}")
+        else:
+            c.drawString(55, y, f"€/m2 commercial (zone): {euro(d['commerce_eur_m2'])}")
+            y -= 14
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(55, y, f"Valeur: {euro(res['valeur'])}")
+
+    c.showPage()
+
+    # Page 3 : grille et hypothèses
+    header("Referentiel utilise", "Grille & hypotheses (page 3/3)")
+    y = h - 155
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(40, y, "Ligne referentiel selectionnee")
+    y -= 18
+    c.setFont("Helvetica", 10)
+
+    c.drawString(55, y, f"Zone: {zone_row['zone']}")
     y -= 14
-    c.drawString(55, y, f"Min: {pm2(min(pm2_list))}")
-    c.drawString(260, y, f"Max: {pm2(max(pm2_list))}")
-    y -= 22
+    c.drawString(55, y, f"Type: {zone_row['type']}")
+    y -= 14
+    if zone_row["type"] in ["Maison", "Appartement"]:
+        c.drawString(55, y, f"Base €/m2: {euro(zone_row['base_eur_m2'])}")
+        y -= 14
+        if zone_row["type"] == "Maison":
+            c.drawString(55, y, f"Terrain €/m2: {euro(zone_row['terrain_eur_m2'])}")
+            y -= 14
+    if zone_row["type"] == "Commerce":
+        c.drawString(55, y, f"Commerce €/m2 (si methode €/m2): {euro(zone_row['commerce_eur_m2'])}")
+        y -= 14
 
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(40, y, "Tableau des comparables")
-    y -= 16
-
-    c.setFont("Helvetica-Bold", 9)
-    headers = ["#", "Prix", "Surf", "EUR/m2", "Date", "Dist(km)", "Etat", "EPC", "Note"]
-    x = [40, 60, 120, 170, 235, 295, 350, 410, 440]
-    for i, hd in enumerate(headers):
-        c.drawString(x[i], y, hd)
     y -= 10
-    c.line(40, y, w - 40, y)
-    y -= 12
-
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(40, y, "Parametres (extraits)")
+    y -= 18
     c.setFont("Helvetica", 9)
-    for idx, comp in enumerate(comps[:14], start=1):
-        vpm2 = comp["prix"] / max(comp["surface"], 1.0)
-        row = [
-            str(idx),
-            f"{comp['prix']:,.0f}".replace(",", " "),
-            f"{comp['surface']:.0f}",
-            f"{vpm2:,.0f}".replace(",", " "),
-            comp["date_vente"],
-            f"{comp['distance_km']:.1f}",
-            comp["etat"],
-            comp["epc"],
-            (comp.get("note") or "")[:22],
-        ]
-        for i, cell in enumerate(row):
-            c.drawString(x[i], y, cell)
-        y -= 12
-        if y < 70:
-            c.showPage()
-            draw_header(c, "Comparables (suite)", "")
-            y = h - 165
+    c.drawString(55, y, f"PEB A:+6%  B:+3%  C:0%  D:-3%  E:-6%  F:-9%  G:-12%")
+    y -= 12
+    c.drawString(55, y, f"Etat Renove:+8%  Bon:+3%  A rafraichir:-3%  A renover:-10%")
+    y -= 12
+    c.drawString(55, y, f"Fourchette: +/- {int(params['fourchette_pct']*100)}%")
+    y -= 12
+    c.drawString(55, y, f"Annexes (garage/parking/terrasse/jardin/cave): valeurs fixes (modifiables)")
 
-    c.setFont("Helvetica-Oblique", 8)
-    c.drawString(40, 40, "Comparables conseilles: proches, recents, et similaires (type/surface).")
     c.save()
-
     buf.seek(0)
     return buf.getvalue()
 
 
-# ---------------- UI ----------------
-st.set_page_config(page_title="Estimateur - La Priorite Immobiliere", layout="wide")
-st.title("Estimateur web - La Priorite Immobiliere (Wallonie)")
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title="Estimateur Expert - La Priorite Immobiliere", layout="wide")
+st.title("Estimateur Expert - La Priorite Immobiliere")
 
-with st.expander("Parametres (ajustables)", expanded=False):
-    params = {
-        "epc_A": st.number_input("EPC A (%)", value=6.0) / 100.0,
-        "epc_B": st.number_input("EPC B (%)", value=3.0) / 100.0,
-        "epc_C": st.number_input("EPC C (%)", value=0.0) / 100.0,
-        "epc_D": st.number_input("EPC D (%)", value=-3.0) / 100.0,
-        "epc_E": st.number_input("EPC E (%)", value=-6.0) / 100.0,
-        "epc_F": st.number_input("EPC F (%)", value=-9.0) / 100.0,
-        "epc_G": st.number_input("EPC G (%)", value=-12.0) / 100.0,
-        "etat_renove": st.number_input("Etat Renove (%)", value=8.0) / 100.0,
-        "etat_bon": st.number_input("Etat Bon (%)", value=3.0) / 100.0,
-        "etat_rafraichir": st.number_input("Etat A rafraichir (%)", value=-3.0) / 100.0,
-        "etat_renover": st.number_input("Etat A renover (%)", value=-10.0) / 100.0,
-        "garage_valeur": st.number_input("Valeur garage (EUR)", value=15000.0, step=1000.0),
-        "terrain_eur_m2": st.number_input("Valeur terrain (EUR/m2)", value=15.0, step=1.0),
-        "fourchette_pct": st.number_input("Fourchette (+/- %)", value=6.0) / 100.0,
-    }
+# Init session state
+if "zones" not in st.session_state:
+    st.session_state["zones"] = DEFAULT_ZONES.copy()
+if "params" not in st.session_state:
+    st.session_state["params"] = DEFAULT_PARAMS.copy()
 
-colA, colB = st.columns(2)
+tab1, tab2 = st.tabs(["1) Referentiel (ta grille)", "2) Estimation + Rapport"])
 
-with colA:
-    st.subheader("1) Bien a estimer")
+with tab1:
+    st.subheader("Ta grille de reference (modifiable)")
+    st.write("Tu peux adapter les prix €/m2 par zone et par type. C'est ta base expert.")
+
+    zones = st.session_state["zones"]
+    st.dataframe(zones, use_container_width=True)
+
+    st.markdown("### Ajouter une ligne referentiel")
+    c1, c2, c3 = st.columns(3)
+    zone = c1.text_input("Zone (ex: Namur - Centre)")
+    typ = c2.selectbox("Type", ["Maison", "Appartement", "Commerce"])
+    base = c3.number_input("Base €/m2 (habitable)", min_value=0, value=0, step=50)
+
+    c4, c5 = st.columns(2)
+    terrain = c4.number_input("Terrain €/m2 (maisons)", min_value=0, value=0, step=1)
+    commerce_m2 = c5.number_input("Commerce €/m2 (si commerce)", min_value=0, value=0, step=50)
+
+    if st.button("Ajouter au referentiel"):
+        if zone.strip():
+            zones.append({"zone": zone.strip(), "type": typ, "base_eur_m2": int(base), "terrain_eur_m2": int(terrain), "commerce_eur_m2": int(commerce_m2)})
+            st.session_state["zones"] = zones
+            st.success("Ligne ajoutee.")
+
+    st.markdown("### Parametres (ajustements)")
+    p = st.session_state["params"]
+    colA, colB = st.columns(2)
+    with colA:
+        st.write("PEB (en %)")
+        p["peb_A"] = st.number_input("PEB A", value=float(p["peb_A"]*100)) / 100.0
+        p["peb_B"] = st.number_input("PEB B", value=float(p["peb_B"]*100)) / 100.0
+        p["peb_C"] = st.number_input("PEB C", value=float(p["peb_C"]*100)) / 100.0
+        p["peb_D"] = st.number_input("PEB D", value=float(p["peb_D"]*100)) / 100.0
+        p["peb_E"] = st.number_input("PEB E", value=float(p["peb_E"]*100)) / 100.0
+        p["peb_F"] = st.number_input("PEB F", value=float(p["peb_F"]*100)) / 100.0
+        p["peb_G"] = st.number_input("PEB G", value=float(p["peb_G"]*100)) / 100.0
+    with colB:
+        st.write("Etat (en %)")
+        p["etat_renove"] = st.number_input("Renove", value=float(p["etat_renove"]*100)) / 100.0
+        p["etat_bon"] = st.number_input("Bon", value=float(p["etat_bon"]*100)) / 100.0
+        p["etat_rafraichir"] = st.number_input("A rafraichir", value=float(p["etat_rafraichir"]*100)) / 100.0
+        p["etat_renover"] = st.number_input("A renover", value=float(p["etat_renover"]*100)) / 100.0
+
+    st.write("Annexes (valeurs fixes)")
+    p["garage"] = st.number_input("Garage", value=int(p["garage"]), step=500)
+    p["parking"] = st.number_input("Parking", value=int(p["parking"]), step=500)
+    p["terrasse"] = st.number_input("Terrasse", value=int(p["terrasse"]), step=250)
+    p["jardin"] = st.number_input("Jardin", value=int(p["jardin"]), step=250)
+    p["cave"] = st.number_input("Cave", value=int(p["cave"]), step=250)
+
+    st.write("Degressivite (expert)")
+    p["seuil_degressif_m2"] = st.number_input("Seuil m2", value=int(p["seuil_degressif_m2"]), step=10)
+    p["degressif_pct"] = st.number_input("Baisse % au-dessus du seuil", value=float(p["degressif_pct"]*100)) / 100.0
+
+    st.write("Fourchette")
+    p["fourchette_pct"] = st.number_input("+/- %", value=float(p["fourchette_pct"]*100)) / 100.0
+
+    st.session_state["params"] = p
+    st.success("Parametres mis a jour (sauvegarde en session).")
+
+with tab2:
+    st.subheader("Estimation (mode expert, sans comparables)")
+    zones = st.session_state["zones"]
+    params = st.session_state["params"]
+
+    zone_names = sorted(list({z["zone"] for z in zones}))
+    zone_sel = st.selectbox("Choisir la zone", zone_names)
+
+    type_sel = st.selectbox("Type de bien", ["Maison", "Appartement", "Commerce"])
+
+    # Filtrer lignes
+    possible = [z for z in zones if z["zone"] == zone_sel and z["type"] == type_sel]
+    if not possible:
+        st.error("Aucune ligne referentiel pour cette zone + ce type. Ajoute-la dans l'onglet Referentiel.")
+        st.stop()
+
+    zone_row = possible[0]  # si plusieurs, on prend la premiere (on peut affiner plus tard)
+
+    commune = st.text_input("Adresse / Commune (texte)")
+    surface = st.number_input("Surface (m2)", min_value=1, value=100, step=1)
+
     bien = {
-        "commune": st.text_input("Commune"),
-        "type_bien": st.selectbox("Type", ["Maison", "Appartement"]),
-        "surface": st.number_input("Surface habitable (m2)", min_value=10.0, value=120.0, step=1.0),
-        "terrain": st.number_input("Terrain (m2)", min_value=0.0, value=0.0, step=10.0),
-        "etat": st.selectbox("Etat", ["Bon", "Renove", "A rafraichir", "A renover"]),
-        "epc": st.selectbox("EPC", ["A", "B", "C", "D", "E", "F", "G"], index=2),
-        "garage": st.checkbox("Garage / parking"),
-        "remarques": st.text_area("Remarques (optionnel)"),
+        "type": type_sel,
+        "commune": commune.strip(),
+        "surface": float(surface),
+        "terrain": 0.0,
+        "etat": "Bon",
+        "peb": "C",
+        "garage": False,
+        "parking": False,
+        "terrasse": False,
+        "jardin": False,
+        "cave": False,
+        "methode_commerce": "€/m2",
+        "loyer_mensuel": 0.0,
+        "taux_rendement": 7.0,
     }
 
-with colB:
-    st.subheader("2) Comparables")
-    if "comps" not in st.session_state:
-        st.session_state["comps"] = []
+    if type_sel == "Maison":
+        bien["terrain"] = float(st.number_input("Terrain (m2)", min_value=0, value=0, step=10))
+        bien["etat"] = st.selectbox("Etat", ["Bon", "Renove", "A rafraichir", "A renover"])
+        bien["peb"] = st.selectbox("PEB", ["A","B","C","D","E","F","G"], index=2)
+    elif type_sel == "Appartement":
+        bien["etat"] = st.selectbox("Etat", ["Bon", "Renove", "A rafraichir", "A renover"])
+        bien["peb"] = st.selectbox("PEB", ["A","B","C","D","E","F","G"], index=2)
+    else:
+        bien["methode_commerce"] = st.selectbox("Methode commerce", ["€/m2", "Rendement"])
+        if bien["methode_commerce"] == "Rendement":
+            bien["loyer_mensuel"] = float(st.number_input("Loyer mensuel (EUR)", min_value=0, value=0, step=50))
+            bien["taux_rendement"] = float(st.number_input("Taux rendement (%)", min_value=1.0, value=7.0, step=0.25))
 
-    with st.form("add_comp", clear_on_submit=True):
-        prix = st.number_input("Prix (EUR)", min_value=10000.0, value=250000.0, step=1000.0)
-        surface_c = st.number_input("Surface (m2)", min_value=10.0, value=120.0, step=1.0)
-        date_vente = st.date_input("Date de vente", value=date(2025, 10, 1))
-        distance_km = st.number_input("Distance (km)", min_value=0.0, value=1.0, step=0.1)
-        etat_c = st.selectbox("Etat (comp)", ["Bon", "Renove", "A rafraichir", "A renover"])
-        epc_c = st.selectbox("EPC (comp)", ["A", "B", "C", "D", "E", "F", "G"], index=2)
-        note = st.text_input("Note (optionnel)")
-        ok = st.form_submit_button("Ajouter comparable")
-        if ok:
-            st.session_state["comps"].append({
-                "prix": float(prix),
-                "surface": float(surface_c),
-                "date_vente": date_vente.isoformat(),
-                "distance_km": float(distance_km),
-                "etat": etat_c,
-                "epc": epc_c,
-                "note": note,
-            })
+    st.markdown("### Annexes")
+    a1, a2, a3, a4, a5 = st.columns(5)
+    bien["garage"] = a1.checkbox("Garage")
+    bien["parking"] = a2.checkbox("Parking")
+    bien["terrasse"] = a3.checkbox("Terrasse")
+    bien["jardin"] = a4.checkbox("Jardin")
+    bien["cave"] = a5.checkbox("Cave")
 
-    if st.session_state["comps"]:
-        st.dataframe(st.session_state["comps"], use_container_width=True)
-        if st.button("Supprimer le dernier comparable"):
-            st.session_state["comps"].pop()
+    st.markdown("---")
 
-st.markdown("---")
-st.subheader("3) Resultats & Rapport vendeur (PDF 3 pages)")
+    if type_sel in ["Maison", "Appartement"]:
+        res = estimate_residentiel(zone_row, {"type": type_sel, **bien}, params)
+    else:
+        res = estimate_commerce(zone_row, bien, params)
 
-res = estimate(bien, st.session_state["comps"], params)
-if res is None:
-    st.warning("Ajoute au moins 3 comparables (idealement 5 a 8) pour generer une estimation.")
-else:
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     c1.metric("Prix conseille", euro(res["valeur"]))
-    c2.metric("Basse", euro(res["low"]))
-    c3.metric("Haute", euro(res["high"]))
-    c4.metric("EUR/m2 estime", pm2(res["pm2_estime"]))
+    c2.metric("Fourchette basse", euro(res["low"]))
+    c3.metric("Fourchette haute", euro(res["high"]))
 
-    pdf = build_pdf_3pages(bien, st.session_state["comps"], res, params)
+    pdf = make_pdf_3pages(bien, zone_row, res, params)
     st.download_button(
-        "Telecharger le rapport vendeur (PDF - 3 pages)",
+        "Telecharger rapport vendeur (PDF - 3 pages)",
         data=pdf,
-        file_name=f"Rapport_estimation_{date.today().isoformat()}.pdf",
+        file_name=f"Rapport_Expert_{date.today().isoformat()}.pdf",
         mime="application/pdf",
     )
