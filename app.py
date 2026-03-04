@@ -5,12 +5,6 @@ from statistics import mean, median
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
-
-try:
-    from PIL import Image
-except Exception:
-    Image = None
 
 
 # =========================
@@ -18,7 +12,6 @@ except Exception:
 # =========================
 AGENCE = "LA PRIORITE IMMOBILIERE"
 EMAIL = "sbelhmira@gmail.com"
-LOGO_PATH = "assets/logo.png"  # mets ton logo ici (optionnel)
 
 
 # =========================
@@ -55,22 +48,14 @@ def parse_price_to_float(x) -> float:
 
 def draw_header(c: canvas.Canvas, title: str, subtitle: str):
     w, h = A4
-    # Logo
-    try:
-        if Image is not None:
-            img = Image.open(LOGO_PATH)
-            c.drawImage(ImageReader(img), 40, h - 120, width=140, height=80, mask="auto")
-    except Exception:
-        pass
-
     c.setFont("Helvetica-Bold", 14)
-    c.drawString(200, h - 55, title)
+    c.drawString(40, h - 55, title)
     c.setFont("Helvetica", 10)
-    c.drawString(200, h - 72, AGENCE)
-    c.drawString(200, h - 86, f"Contact: {EMAIL}")
-    c.drawString(200, h - 100, f"Date: {date.today().strftime('%d/%m/%Y')}")
+    c.drawString(40, h - 72, AGENCE)
+    c.drawString(40, h - 86, f"Contact: {EMAIL}")
+    c.drawString(40, h - 100, f"Date: {date.today().strftime('%d/%m/%Y')}")
     c.setFont("Helvetica-Oblique", 9)
-    c.drawString(200, h - 114, subtitle)
+    c.drawString(40, h - 114, subtitle)
     c.line(40, h - 130, w - 40, h - 130)
 
 
@@ -79,7 +64,6 @@ def draw_header(c: canvas.Canvas, title: str, subtitle: str):
 # =========================
 DEFAULT_PARAMS = {
     # Prix/m² de départ (par province) — utilisés tant que l'historique n'a pas appris localement
-    # Tu peux les ajuster, mais l’app apprend ensuite automatiquement.
     "base_m2_Hainaut_Maison": 1600,
     "base_m2_Hainaut_Appartement": 1750,
     "base_m2_Hainaut_Commerce": 2100,
@@ -100,7 +84,7 @@ DEFAULT_PARAMS = {
     "base_m2_Luxembourg_Appartement": 2550,
     "base_m2_Luxembourg_Commerce": 2400,
 
-    # Terrain €/m² (valeurs de départ, l’outil peut apprendre ensuite aussi)
+    # Terrain €/m² (valeurs de départ)
     "terrain_Hainaut": 60,
     "terrain_Namur": 90,
     "terrain_Liege": 85,
@@ -180,6 +164,31 @@ DEFAULT_PARAMS = {
     "grenier_amenageable_base": 5000,
     "grenier_amenageable_eur_m2": 120,
 
+    # === Nouveaux impacts demandés ===
+    # État général
+    "etat_neuf": 15000,
+    "etat_bon": 5000,
+    "etat_moyen": 0,
+    "etat_renover": -20000,
+    "etat_tres_degrade": -40000,
+
+    # Parachèvement
+    "parach_haut": 20000,
+    "parach_standard": 0,
+    "parach_basique": -8000,
+    "parach_non_termine": -20000,
+
+    # Façades
+    "facades_2": 0,
+    "facades_3": 10000,
+    "facades_4": 20000,
+
+    # Extramuros
+    "extramuros_eur_m2": 120,
+
+    # Surface habitable vs totale (pénalité si écart trop grand)
+    "penalite_surface_non_habitable_eur_m2": -80,
+
     # Coefficient expert
     "coef_expert_min": -3.0,
     "coef_expert_max": 3.0,
@@ -215,7 +224,7 @@ def base_terrain_m2_from_province(province: str, params: dict) -> float:
 def calc_price_m2_learned(history: list, cp: str, localite: str, type_bien: str, min_n: int) -> float | None:
     """
     Apprend un prix/m² à partir des ventes (prix_vendu) pour le même CP + localité + type.
-    prix/m² = prix_vendu / surface
+    prix/m² = prix_vendu / surface_totale (ou surface si pas dispo)
     Retourne médiane si assez de ventes, sinon None.
     """
     cp = (cp or "").strip()
@@ -236,7 +245,10 @@ def calc_price_m2_learned(history: list, cp: str, localite: str, type_bien: str,
             if vendu <= 0:
                 continue
 
-            surf = float(r.get("surface_m2", 0) or 0)
+            # surface totale prioritaire si enregistrée
+            surf = float(r.get("surface_totale_m2", 0) or 0)
+            if surf <= 5:
+                surf = float(r.get("surface_m2", 0) or 0)
             if surf <= 5:
                 continue
 
@@ -247,7 +259,6 @@ def calc_price_m2_learned(history: list, cp: str, localite: str, type_bien: str,
     if len(values) < int(min_n):
         return None
 
-    # médiane = stable
     return float(median(values))
 
 
@@ -295,13 +306,13 @@ def calc_marche_auto(bien: dict, params: dict, history: list) -> dict:
     """
     Marché automatique:
     - prix/m² appris (si assez de ventes) sinon prix/m² province
-    - applique dégressivité surface
+    - applique dégressivité surface_totale
     - terrain €/m² province (pour maison)
     """
     province = bien["province"]
     type_bien = bien["type"]
-    surface = float(bien["surface"])
-    terrain = float(bien["terrain"])
+    surface_totale = float(bien["surface_totale_m2"])
+    terrain = float(bien["terrain_m2"])
 
     learned = calc_price_m2_learned(
         history=history,
@@ -312,9 +323,9 @@ def calc_marche_auto(bien: dict, params: dict, history: list) -> dict:
     )
 
     prix_m2_base = learned if learned is not None else base_price_m2_from_province(province, type_bien, params)
-    prix_m2_applique = apply_degressivity(prix_m2_base, surface, params)
+    prix_m2_applique = apply_degressivity(prix_m2_base, surface_totale, params)
 
-    valeur_batie = surface * prix_m2_applique
+    valeur_batie = surface_totale * prix_m2_applique
 
     valeur_terrain = 0.0
     terrain_m2 = 0.0
@@ -336,7 +347,7 @@ def calc_marche_auto(bien: dict, params: dict, history: list) -> dict:
 
 
 # =========================
-# Calculs techniques / impacts
+# Impacts (techniques + caractéristiques)
 # =========================
 def calc_toiture_impact(bien: dict, params: dict) -> float:
     etat = bien["toiture_etat"]
@@ -347,7 +358,7 @@ def calc_toiture_impact(bien: dict, params: dict) -> float:
     if not has_grenier:
         calc = float(params["toit_forfait_sans_grenier"])
     else:
-        surf = float(bien["toiture_surface_grenier"])
+        surf = float(bien["toiture_surface_grenier_m2"])
         calc = float(params["toit_base_avec_grenier"]) + surf * float(params["toit_eur_m2_grenier"])
 
     if etat == "Moyenne":
@@ -431,7 +442,6 @@ def calc_etage_appart_impact(bien: dict, params: dict) -> float:
         return 0.0
     etage = int(bien.get("etage", 0))
     asc = bool(bien.get("ascenseur", False))
-
     if etage == 0:
         return float(params["etage_rdc_malus"])
     if asc:
@@ -468,6 +478,63 @@ def calc_jardin_cave_grenier_impact(bien: dict, params: dict) -> float:
     return float(impact)
 
 
+# === Nouveaux impacts demandés ===
+def calc_etat_general_impact(bien: dict, params: dict) -> float:
+    mapping = {
+        "Neuf / parfait": float(params["etat_neuf"]),
+        "Bon etat": float(params["etat_bon"]),
+        "Etat moyen": float(params["etat_moyen"]),
+        "A renover": float(params["etat_renover"]),
+        "Tres degrade": float(params["etat_tres_degrade"]),
+    }
+    return float(mapping.get(bien["etat_general"], 0.0))
+
+
+def calc_parachevement_impact(bien: dict, params: dict) -> float:
+    mapping = {
+        "Haut standing": float(params["parach_haut"]),
+        "Standard": float(params["parach_standard"]),
+        "Basique": float(params["parach_basique"]),
+        "Non termine": float(params["parach_non_termine"]),
+    }
+    return float(mapping.get(bien["parachevement"], 0.0))
+
+
+def calc_facades_impact(bien: dict, params: dict) -> float:
+    mapping = {
+        2: float(params["facades_2"]),
+        3: float(params["facades_3"]),
+        4: float(params["facades_4"]),
+    }
+    return float(mapping.get(int(bien["nb_facades"]), 0.0))
+
+
+def calc_extramuros_impact(bien: dict, params: dict) -> float:
+    # extramuros (balcon couvert, annexes hors murs etc.) valorisé au m²
+    s = float(bien.get("surface_extramuros_m2", 0.0))
+    if s <= 0:
+        return 0.0
+    return s * float(params["extramuros_eur_m2"])
+
+
+def calc_surface_mix_impact(bien: dict, params: dict) -> float:
+    """
+    Si surface totale >> habitable, on pénalise une partie non habitable.
+    C’est une règle simple “expert” (modifiable).
+    """
+    hab = float(bien["surface_habitable_m2"])
+    tot = float(bien["surface_totale_m2"])
+    if tot <= 0 or hab <= 0:
+        return 0.0
+
+    non_hab = max(0.0, tot - hab)
+    if non_hab <= 0:
+        return 0.0
+
+    # pénalité au m² non habitable
+    return non_hab * float(params["penalite_surface_non_habitable_eur_m2"])
+
+
 def calc_indice(bien: dict) -> float:
     toiture_map = {"Parfaite": 10, "Moyenne": 6, "Mauvaise": 2}
     chauff_map = {
@@ -481,6 +548,8 @@ def calc_indice(bien: dict) -> float:
     sdb_map = {"Bonne": 8, "A moderniser": 5, "A remplacer": 2}
     vitrage_map = {"Simple": 2, "Double ancien": 5, "Double recent": 8, "Triple": 9}
     peb_map = {"A": 10, "B": 9, "C": 8, "D": 6, "E": 4, "F": 3, "G": 2}
+    etat_map = {"Neuf / parfait": 10, "Bon etat": 8, "Etat moyen": 6, "A renover": 3, "Tres degrade": 1}
+    parach_map = {"Haut standing": 9, "Standard": 7, "Basique": 5, "Non termine": 2}
 
     notes = [
         float(toiture_map.get(bien["toiture_etat"], 6)),
@@ -489,6 +558,8 @@ def calc_indice(bien: dict) -> float:
         float(sdb_map.get(bien["sdb_etat"], 5)),
         float(vitrage_map.get(bien["vitrage_type"], 6)),
         float(peb_map.get((bien.get("peb_lettre") or "C").upper(), 6)),
+        float(etat_map.get(bien["etat_general"], 6)),
+        float(parach_map.get(bien["parachevement"], 6)),
     ]
     return float(mean(notes))
 
@@ -534,14 +605,19 @@ def build_pdf_3pages(bien: dict, marche: dict, impacts: dict, indice: float,
     c.drawString(55, y, f"Code postal: {safe_text(bien['cp'], 10)}  |  Localite: {safe_text(bien['localite'], 40)}"); y -= 14
     c.drawString(55, y, f"Province: {bien['province']}  |  Type: {bien['type']}"); y -= 14
 
-    c.drawString(55, y, f"Surface: {bien['surface']:.0f} m2" + (f"  |  Terrain: {bien['terrain']:.0f} m2" if bien["type"] == "Maison" else "")); y -= 14
+    c.drawString(55, y, f"Surface habitable: {bien['surface_habitable_m2']:.0f} m2  |  Surface totale: {bien['surface_totale_m2']:.0f} m2  |  Extramuros: {bien['surface_extramuros_m2']:.0f} m2"); y -= 14
+    if bien["type"] == "Maison":
+        c.drawString(55, y, f"Terrain: {bien['terrain_m2']:.0f} m2"); y -= 14
+
+    c.drawString(55, y, f"Façades: {int(bien['nb_facades'])}  |  Etat general: {bien['etat_general']}  |  Parachevement: {bien['parachevement']}"); y -= 14
+
     c.drawString(55, y, f"Chambres: {int(bien.get('nb_chambres', 0))}  |  Salles de bain: {int(bien.get('nb_sdb', 0))}"); y -= 14
 
     if bien["type"] == "Appartement":
         c.drawString(55, y, f"Etage: {int(bien.get('etage', 0))}  |  Ascenseur: {'Oui' if bien.get('ascenseur') else 'Non'}"); y -= 14
 
     c.drawString(55, y, f"PEB: {bien['peb_lettre']}" + (f" ({bien['peb_kwh']:.0f} kWh/m2.an)" if bien['peb_kwh'] else "")); y -= 14
-    c.drawString(55, y, f"Vitrage: {bien['vitrage_type']}"); y -= 14
+    c.drawString(55, y, f"Vitrage: {bien['vitrage_type']}  |  Chauffage: {bien['chauffage_type']}"); y -= 14
 
     c.drawString(55, y, f"Parking: {int(bien.get('nb_places_parking', 0))}  |  Garage: {'Oui' if bien.get('garage') else 'Non'}"); y -= 14
     c.drawString(55, y, f"Balcon: {'Oui' if bien.get('balcon') else 'Non'}  |  Terrasse: {'Oui' if bien.get('terrasse') else 'Non'}"); y -= 14
@@ -595,7 +671,7 @@ def build_pdf_3pages(bien: dict, marche: dict, impacts: dict, indice: float,
     y -= 18
     c.setFont("Helvetica", 10)
     c.drawString(55, y, f"Prix/m2 base: {euro(marche['prix_m2_base'])}  |  Applique: {euro(marche['prix_m2_applique'])}  |  Source: {marche['prix_m2_source']}"); y -= 14
-    c.drawString(55, y, f"Valeur batie: {euro(marche['valeur_batie'])}"); y -= 14
+    c.drawString(55, y, f"Valeur batie (surface totale): {euro(marche['valeur_batie'])}"); y -= 14
     if bien["type"] == "Maison":
         c.drawString(55, y, f"Terrain: {euro(marche['terrain_m2'])}/m2  |  Valeur terrain: {euro(marche['valeur_terrain'])}"); y -= 14
     c.setFont("Helvetica-Bold", 10)
@@ -608,7 +684,12 @@ def build_pdf_3pages(bien: dict, marche: dict, impacts: dict, indice: float,
     c.setFont("Helvetica", 10)
 
     lines = [
-        (f"Coef quartier (auto)", (coef_quartier - 1.0) * marche["valeur_marche"]),
+        ("Coef quartier (auto)", (coef_quartier - 1.0) * marche["valeur_marche"]),
+        ("Etat general", impacts["etat_general"]),
+        ("Parachevement", impacts["parachevement"]),
+        ("Nombre de facades", impacts["facades"]),
+        ("Extramuros", impacts["extramuros"]),
+        ("Surface non habitable (penalite)", impacts["surface_mix"]),
         (f"Toiture ({bien['toiture_etat']})", impacts["toiture"]),
         (f"Chauffage ({bien['chauffage_type']})", impacts["chauffage"]),
         (f"Chassis/Vitrage ({bien['vitrage_type']})", impacts["vitrage"]),
@@ -628,6 +709,11 @@ def build_pdf_3pages(bien: dict, marche: dict, impacts: dict, indice: float,
             continue
         c.drawString(55, y, f"{label}: {euro(val)}")
         y -= 14
+        if y < 80:
+            c.showPage()
+            draw_header(c, "Detail des calculs (suite)", "Impacts (page 2/3)")
+            y = h - 165
+            c.setFont("Helvetica", 10)
 
     c.setFont("Helvetica-Bold", 10)
     c.drawString(55, y, f"Total impacts (hors coef expert): {euro(impacts['total'])}")
@@ -655,8 +741,8 @@ def build_pdf_3pages(bien: dict, marche: dict, impacts: dict, indice: float,
     lines3 = [
         "1) Marche automatique: base province + apprentissage (ventes encodees).",
         "2) Coef quartier (auto): ajuste selon ratios Vendu/Estime sur meme CP+localite+type.",
-        "3) Impacts: technique + caracteristiques (chambres, sdb, annexes) appliques automatiquement.",
-        "4) Indice global (/10): toiture, chauffage, cuisine, sdb, vitrage, PEB; influence la fourchette.",
+        "3) Impacts: etat general, parachèvement, facades, surfaces, technique + caracteristiques.",
+        "4) Indice global (/10): toiture, chauffage, cuisine, sdb, vitrage, PEB, etat, parachèvement; influence la fourchette.",
         "5) Coef expert: ajustement final (rue, nuisances, vue, attractivite) avec justification.",
     ]
     for ln in lines3:
@@ -716,14 +802,32 @@ with st.sidebar:
 
     st.subheader("Bien")
     type_bien = st.selectbox("Type", ["Maison", "Appartement", "Commerce"])
-    surface = st.number_input("Surface totale (m2)", min_value=1.0, value=100.0, step=1.0)
+
+    # === Surfaces (demandé) ===
+    surface_habitable = st.number_input("Surface habitable (m²)", min_value=0.0, value=100.0, step=1.0)
+    surface_totale = st.number_input("Surface totale (m²)", min_value=1.0, value=120.0, step=1.0)
+    surface_extramuros = st.number_input("Surface extramuros (m²)", min_value=0.0, value=0.0, step=1.0)
+
     terrain = 0.0
     if type_bien == "Maison":
-        terrain = st.number_input("Terrain (m2)", min_value=0.0, value=0.0, step=10.0)
+        terrain = st.number_input("Terrain (m²)", min_value=0.0, value=0.0, step=10.0)
+
+    nb_facades = st.selectbox("Nombre de facades", [2, 3, 4])
+
+    etat_general = st.selectbox(
+        "Etat general du bien",
+        ["Neuf / parfait", "Bon etat", "Etat moyen", "A renover", "Tres degrade"]
+    )
+
+    parachevement = st.selectbox(
+        "Niveau de parachèvement",
+        ["Haut standing", "Standard", "Basique", "Non termine"]
+    )
 
     nb_chambres = st.number_input("Nombre de chambres", min_value=0, value=2, step=1)
     nb_sdb = st.number_input("Nombre de salles de bain", min_value=0, value=1, step=1)
 
+    # Appartement
     etage = st.number_input("Etage (0 = RDC)", min_value=0, value=0, step=1)
     ascenseur = st.checkbox("Ascenseur", value=False)
 
@@ -739,7 +843,7 @@ with st.sidebar:
 
     grenier_amenageable = st.checkbox("Grenier amenageable", value=False)
     grenier_amenageable_surface_m2 = st.number_input(
-        "Surface grenier amenageable (m2)",
+        "Surface grenier amenageable (m²)",
         min_value=0.0, value=0.0, step=5.0,
         disabled=not grenier_amenageable
     )
@@ -749,7 +853,7 @@ with st.sidebar:
     surfaces_etages = []
     for i in range(int(nb_etages)):
         s = st.number_input(
-            f"Surface etage {i+1} (m2)",
+            f"Surface etage {i+1} (m²)",
             min_value=0.0, value=0.0, step=5.0,
             key=f"surf_etage_{i+1}"
         )
@@ -772,8 +876,17 @@ bien = {
     "localite": localite.strip(),
     "province": province,
     "type": type_bien,
-    "surface": float(surface),
-    "terrain": float(terrain),
+
+    # surfaces
+    "surface_habitable_m2": float(surface_habitable),
+    "surface_totale_m2": float(surface_totale),
+    "surface_extramuros_m2": float(surface_extramuros),
+
+    "terrain_m2": float(terrain),
+
+    "nb_facades": int(nb_facades),
+    "etat_general": etat_general,
+    "parachevement": parachevement,
 
     "nb_chambres": int(nb_chambres),
     "nb_sdb": int(nb_sdb),
@@ -800,7 +913,7 @@ bien = {
 
     # Technique defaults (remplis onglet technique)
     "toiture_grenier": False,
-    "toiture_surface_grenier": 0.0,
+    "toiture_surface_grenier_m2": 0.0,
     "toiture_etat": "Parfaite",
     "chauffage_type": "Gaz condensation",
     "cuisine_etat": "Bonne",
@@ -809,6 +922,39 @@ bien = {
     "peb_lettre": "C",
     "peb_kwh": 0.0,
 }
+
+
+def compute_impacts(bien: dict, params: dict) -> dict:
+    impacts = {
+        "etat_general": calc_etat_general_impact(bien, params),
+        "parachevement": calc_parachevement_impact(bien, params),
+        "facades": calc_facades_impact(bien, params),
+        "extramuros": calc_extramuros_impact(bien, params),
+        "surface_mix": calc_surface_mix_impact(bien, params),
+
+        "toiture": calc_toiture_impact(bien, params),
+        "chauffage": calc_chauffage_impact(bien, params),
+        "vitrage": calc_vitrage_impact(bien, params),
+        "peb": calc_peb_impact(bien, params),
+        "cuisine": calc_cuisine_impact(bien, params),
+        "sdb_etat": calc_sdb_etat_impact(bien, params),
+        "chambres": calc_chambres_impact(bien, params),
+        "sdb_count": calc_sdb_count_impact(bien, params),
+        "etage_appart": calc_etage_appart_impact(bien, params),
+        "parking_garage": calc_parking_garage_impact(bien, params),
+        "balcon_terrasse": calc_balcon_terrasse_impact(bien, params),
+        "jardin_cave_grenier": calc_jardin_cave_grenier_impact(bien, params),
+    }
+
+    impacts["total"] = (
+        impacts["etat_general"] + impacts["parachevement"] + impacts["facades"]
+        + impacts["extramuros"] + impacts["surface_mix"]
+        + impacts["toiture"] + impacts["chauffage"] + impacts["vitrage"] + impacts["peb"]
+        + impacts["cuisine"] + impacts["sdb_etat"]
+        + impacts["chambres"] + impacts["sdb_count"] + impacts["etage_appart"]
+        + impacts["parking_garage"] + impacts["balcon_terrasse"] + impacts["jardin_cave_grenier"]
+    )
+    return impacts
 
 
 # =========================
@@ -826,10 +972,17 @@ with tabs[0]:
     c1.metric("Prix/m2 (source)", f"{marche['prix_m2_source']}")
     c2.metric("Prix/m2 applique", euro(marche["prix_m2_applique"]))
     c3.metric("Coef quartier (auto)", f"{coef_quartier:.2f}")
-    c4.metric("Valeur marche", euro(marche["valeur_marche"] * coef_quartier))
+    c4.metric("Valeur marche (ajustee)", euro(marche["valeur_marche"] * coef_quartier))
 
     if bien["type"] == "Maison":
         st.caption(f"Terrain: {euro(marche['terrain_m2'])}/m2 | Valeur terrain: {euro(marche['valeur_terrain'])}")
+
+    st.markdown("---")
+    st.subheader("Rappel surfaces (dossier)")
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Habitable", f"{bien['surface_habitable_m2']:.0f} m²")
+    s2.metric("Totale", f"{bien['surface_totale_m2']:.0f} m²")
+    s3.metric("Extramuros", f"{bien['surface_extramuros_m2']:.0f} m²")
 
     st.markdown("---")
     st.subheader("Parametres marche (optionnel)")
@@ -882,7 +1035,7 @@ with tabs[1]:
     with t1:
         toiture_grenier = st.checkbox("Grenier present (toiture)", value=False)
     with t2:
-        toiture_surface_grenier = st.number_input("Surface grenier (toiture) (m2)", min_value=0.0, value=0.0, step=5.0, disabled=not toiture_grenier)
+        toiture_surface_grenier = st.number_input("Surface grenier (toiture) (m²)", min_value=0.0, value=0.0, step=5.0, disabled=not toiture_grenier)
     with t3:
         toiture_etat = st.selectbox("Etat toiture", ["Parfaite", "Moyenne", "Mauvaise"])
 
@@ -908,7 +1061,7 @@ with tabs[1]:
 
     # Apply to bien
     bien["toiture_grenier"] = bool(toiture_grenier)
-    bien["toiture_surface_grenier"] = float(toiture_surface_grenier)
+    bien["toiture_surface_grenier_m2"] = float(toiture_surface_grenier)
     bien["toiture_etat"] = toiture_etat
     bien["chauffage_type"] = chauffage_type
     bien["vitrage_type"] = vitrage_type
@@ -917,110 +1070,39 @@ with tabs[1]:
     bien["cuisine_etat"] = cuisine_etat
     bien["sdb_etat"] = sdb_etat
 
-    st.markdown("---")
-    st.subheader("Parametres (impacts) - optionnel")
-    with st.expander("Modifier les impacts (interne)", expanded=False):
-        colA, colB, colC = st.columns(3)
-        with colA:
-            st.write("Toiture")
-            params["toit_forfait_sans_grenier"] = st.number_input("Forfait sans grenier", value=int(params["toit_forfait_sans_grenier"]), step=500)
-            params["toit_base_avec_grenier"] = st.number_input("Base avec grenier", value=int(params["toit_base_avec_grenier"]), step=500)
-            params["toit_eur_m2_grenier"] = st.number_input("EUR/m2 grenier (toiture)", value=int(params["toit_eur_m2_grenier"]), step=5)
-            params["toit_impact_factor"] = st.number_input("Impact factor (ex 0.70)", value=float(params["toit_impact_factor"]), step=0.05)
-            params["toit_etat_moyen_coeff"] = st.number_input("Coeff etat Moyenne (ex 0.50)", value=float(params["toit_etat_moyen_coeff"]), step=0.05)
-
-            st.write("Chambres / SDB")
-            params["impact_par_chambre"] = st.number_input("Impact par chambre (delta vs ref)", value=int(params["impact_par_chambre"]), step=500)
-            params["impact_par_sdb_supp"] = st.number_input("Impact par SDB supplementaire", value=int(params["impact_par_sdb_supp"]), step=500)
-
-        with colB:
-            st.write("Chauffage / Vitrage")
-            params["chauff_pac"] = st.number_input("PAC", value=int(params["chauff_pac"]), step=500)
-            params["chauff_gaz_cond"] = st.number_input("Gaz condensation", value=int(params["chauff_gaz_cond"]), step=500)
-            params["chauff_mazout"] = st.number_input("Mazout", value=int(params["chauff_mazout"]), step=500)
-            params["chauff_electrique"] = st.number_input("Electrique", value=int(params["chauff_electrique"]), step=500)
-            params["chauff_ancien"] = st.number_input("Ancien systeme", value=int(params["chauff_ancien"]), step=500)
-
-            params["vitrage_simple"] = st.number_input("Vitrage simple", value=int(params["vitrage_simple"]), step=500)
-            params["vitrage_double_ancien"] = st.number_input("Double ancien", value=int(params["vitrage_double_ancien"]), step=500)
-            params["vitrage_double_recent"] = st.number_input("Double recent", value=int(params["vitrage_double_recent"]), step=500)
-            params["vitrage_triple"] = st.number_input("Triple", value=int(params["vitrage_triple"]), step=500)
-
-            st.write("Etage appart")
-            params["etage_avec_ascenseur_bonus"] = st.number_input("Etage avec ascenseur (bonus)", value=int(params["etage_avec_ascenseur_bonus"]), step=500)
-            params["etage_sans_ascenseur_malus_par_niveau"] = st.number_input("Sans ascenseur (malus/etage)", value=int(params["etage_sans_ascenseur_malus_par_niveau"]), step=500)
-            params["etage_rdc_malus"] = st.number_input("RDC (malus/bonus)", value=int(params["etage_rdc_malus"]), step=500)
-
-        with colC:
-            st.write("PEB / Cuisine / SDB etat")
-            params["peb_A"] = st.number_input("PEB A", value=int(params["peb_A"]), step=500)
-            params["peb_B"] = st.number_input("PEB B", value=int(params["peb_B"]), step=500)
-            params["peb_C"] = st.number_input("PEB C", value=int(params["peb_C"]), step=500)
-            params["peb_D"] = st.number_input("PEB D", value=int(params["peb_D"]), step=500)
-            params["peb_E"] = st.number_input("PEB E", value=int(params["peb_E"]), step=500)
-            params["peb_F"] = st.number_input("PEB F", value=int(params["peb_F"]), step=500)
-            params["peb_G"] = st.number_input("PEB G", value=int(params["peb_G"]), step=500)
-
-            params["cuisine_moderniser"] = st.number_input("Cuisine a moderniser", value=int(params["cuisine_moderniser"]), step=500)
-            params["cuisine_remplacer"] = st.number_input("Cuisine a remplacer", value=int(params["cuisine_remplacer"]), step=500)
-            params["sdb_moderniser"] = st.number_input("SDB etat a moderniser", value=int(params["sdb_moderniser"]), step=500)
-            params["sdb_remplacer"] = st.number_input("SDB etat a remplacer", value=int(params["sdb_remplacer"]), step=500)
-
-            st.write("Annexes")
-            params["impact_par_place_parking"] = st.number_input("Impact/place parking", value=int(params["impact_par_place_parking"]), step=500)
-            params["impact_garage"] = st.number_input("Impact garage", value=int(params["impact_garage"]), step=500)
-            params["impact_balcon"] = st.number_input("Impact balcon", value=int(params["impact_balcon"]), step=500)
-            params["impact_terrasse"] = st.number_input("Impact terrasse", value=int(params["impact_terrasse"]), step=500)
-            params["impact_jardin"] = st.number_input("Impact jardin", value=int(params["impact_jardin"]), step=500)
-            params["impact_cave"] = st.number_input("Impact cave", value=int(params["impact_cave"]), step=500)
-            params["grenier_amenageable_base"] = st.number_input("Grenier amenageable (base)", value=int(params["grenier_amenageable_base"]), step=500)
-            params["grenier_amenageable_eur_m2"] = st.number_input("Grenier amenageable (EUR/m2)", value=int(params["grenier_amenageable_eur_m2"]), step=5)
-
-        st.session_state["params"] = params
-
-    impacts = {
-        "toiture": calc_toiture_impact(bien, params),
-        "chauffage": calc_chauffage_impact(bien, params),
-        "vitrage": calc_vitrage_impact(bien, params),
-        "peb": calc_peb_impact(bien, params),
-        "cuisine": calc_cuisine_impact(bien, params),
-        "sdb_etat": calc_sdb_etat_impact(bien, params),
-        "chambres": calc_chambres_impact(bien, params),
-        "sdb_count": calc_sdb_count_impact(bien, params),
-        "etage_appart": calc_etage_appart_impact(bien, params),
-        "parking_garage": calc_parking_garage_impact(bien, params),
-        "balcon_terrasse": calc_balcon_terrasse_impact(bien, params),
-        "jardin_cave_grenier": calc_jardin_cave_grenier_impact(bien, params),
-    }
-    impacts["total"] = (
-        impacts["toiture"] + impacts["chauffage"] + impacts["vitrage"] + impacts["peb"]
-        + impacts["cuisine"] + impacts["sdb_etat"]
-        + impacts["chambres"] + impacts["sdb_count"] + impacts["etage_appart"]
-        + impacts["parking_garage"] + impacts["balcon_terrasse"] + impacts["jardin_cave_grenier"]
-    )
-
+    impacts = compute_impacts(bien, params)
     indice = calc_indice(bien)
 
+    st.markdown("---")
+    st.subheader("Impacts (résumé)")
     r1 = st.columns(6)
-    r1[0].metric("Toiture", euro(impacts["toiture"]))
-    r1[1].metric("Chauffage", euro(impacts["chauffage"]))
-    r1[2].metric("Vitrage", euro(impacts["vitrage"]))
-    r1[3].metric("PEB", euro(impacts["peb"]))
-    r1[4].metric("Parking/Garage", euro(impacts["parking_garage"]))
-    r1[5].metric("Balcon/Terrasse", euro(impacts["balcon_terrasse"]))
+    r1[0].metric("Etat general", euro(impacts["etat_general"]))
+    r1[1].metric("Parachevement", euro(impacts["parachevement"]))
+    r1[2].metric("Facades", euro(impacts["facades"]))
+    r1[3].metric("Extramuros", euro(impacts["extramuros"]))
+    r1[4].metric("Surface non hab.", euro(impacts["surface_mix"]))
+    r1[5].metric("Toiture", euro(impacts["toiture"]))
 
     r2 = st.columns(6)
-    r2[0].metric("Cuisine", euro(impacts["cuisine"]))
-    r2[1].metric("SDB etat", euro(impacts["sdb_etat"]))
-    r2[2].metric("Chambres", euro(impacts["chambres"]))
-    r2[3].metric("Nb SDB", euro(impacts["sdb_count"]))
-    r2[4].metric("Etage appart", euro(impacts["etage_appart"]) if bien["type"] == "Appartement" else "0 €")
-    r2[5].metric("Jardin/Cave/Grenier", euro(impacts["jardin_cave_grenier"]))
+    r2[0].metric("Chauffage", euro(impacts["chauffage"]))
+    r2[1].metric("Vitrage", euro(impacts["vitrage"]))
+    r2[2].metric("PEB", euro(impacts["peb"]))
+    r2[3].metric("Cuisine", euro(impacts["cuisine"]))
+    r2[4].metric("SDB etat", euro(impacts["sdb_etat"]))
+    r2[5].metric("Chambres", euro(impacts["chambres"]))
+
+    r3 = st.columns(6)
+    r3[0].metric("Nb SDB", euro(impacts["sdb_count"]))
+    r3[1].metric("Etage appart", euro(impacts["etage_appart"]) if bien["type"] == "Appartement" else "0 €")
+    r3[2].metric("Parking/Garage", euro(impacts["parking_garage"]))
+    r3[3].metric("Balcon/Terrasse", euro(impacts["balcon_terrasse"]))
+    r3[4].metric("Jardin/Cave/Grenier", euro(impacts["jardin_cave_grenier"]))
+    r3[5].metric("TOTAL impacts", euro(impacts["total"]))
 
     st.metric("Indice global", f"{indice:.1f} / 10")
 
     total_etages = sum(bien["surfaces_etages"])
-    if total_etages > 0 and abs(total_etages - bien["surface"]) > 5:
+    if total_etages > 0 and abs(total_etages - bien["surface_totale_m2"]) > 5:
         st.warning("Surfaces par etage ≠ surface totale (ecart > 5 m2)")
 
 
@@ -1033,27 +1115,7 @@ with tabs[2]:
     marche = calc_marche_auto(bien, params, history)
     coef_quartier = calc_coef_quartier(history, bien["cp"], bien["localite"], bien["type"], params)
 
-    impacts = {
-        "toiture": calc_toiture_impact(bien, params),
-        "chauffage": calc_chauffage_impact(bien, params),
-        "vitrage": calc_vitrage_impact(bien, params),
-        "peb": calc_peb_impact(bien, params),
-        "cuisine": calc_cuisine_impact(bien, params),
-        "sdb_etat": calc_sdb_etat_impact(bien, params),
-        "chambres": calc_chambres_impact(bien, params),
-        "sdb_count": calc_sdb_count_impact(bien, params),
-        "etage_appart": calc_etage_appart_impact(bien, params),
-        "parking_garage": calc_parking_garage_impact(bien, params),
-        "balcon_terrasse": calc_balcon_terrasse_impact(bien, params),
-        "jardin_cave_grenier": calc_jardin_cave_grenier_impact(bien, params),
-    }
-    impacts["total"] = (
-        impacts["toiture"] + impacts["chauffage"] + impacts["vitrage"] + impacts["peb"]
-        + impacts["cuisine"] + impacts["sdb_etat"]
-        + impacts["chambres"] + impacts["sdb_count"] + impacts["etage_appart"]
-        + impacts["parking_garage"] + impacts["balcon_terrasse"] + impacts["jardin_cave_grenier"]
-    )
-
+    impacts = compute_impacts(bien, params)
     indice = calc_indice(bien)
 
     valeur_marche_ajustee = marche["valeur_marche"] * coef_quartier
@@ -1110,8 +1172,15 @@ with tabs[2]:
             "localite": safe_text(bien["localite"], 40),
             "province": bien["province"],
             "type_bien": bien["type"],
-            "surface_m2": round(float(bien["surface"]), 1),
-            "terrain_m2": round(float(bien["terrain"]), 1),
+
+            "surface_habitable_m2": round(float(bien["surface_habitable_m2"]), 1),
+            "surface_totale_m2": round(float(bien["surface_totale_m2"]), 1),
+            "surface_extramuros_m2": round(float(bien["surface_extramuros_m2"]), 1),
+            "terrain_m2": round(float(bien["terrain_m2"]), 1),
+
+            "nb_facades": int(bien["nb_facades"]),
+            "etat_general": bien["etat_general"],
+            "parachevement": bien["parachevement"],
 
             "nb_chambres": int(bien["nb_chambres"]),
             "nb_sdb": int(bien["nb_sdb"]),
@@ -1124,7 +1193,7 @@ with tabs[2]:
 
             "toiture_etat": bien["toiture_etat"],
             "toiture_grenier": bool(bien["toiture_grenier"]),
-            "toiture_surface_grenier": round(float(bien["toiture_surface_grenier"]), 1),
+            "toiture_surface_grenier_m2": round(float(bien["toiture_surface_grenier_m2"]), 1),
 
             "chauffage_type": bien["chauffage_type"],
             "cuisine_etat": bien["cuisine_etat"],
