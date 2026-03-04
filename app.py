@@ -4,19 +4,28 @@ from io import BytesIO
 from statistics import mean
 import pandas as pd
 import requests
+import uuid
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
+# =========================
+# Identité
+# =========================
 AGENCE = "LA PRIORITE IMMOBILIERE"
 EMAIL = "sbelhmira@gmail.com"
 
-# Open Data Wallonie-Bruxelles (ODWB / WalStat) - dataset 234002 (prix immobilier résidentiel)
-# Explore API v2.1 (swagger): https://www.odwb.be/api/explore/v2.1/swagger.json
+# =========================
+# Open Data Wallonie-Bruxelles (ODWB/WalStat)
+# Dataset: 234002 (prix immobilier résidentiel)
+# =========================
 ODWB_DATASET_ID = "234002"
 ODWB_EXPORT_CSV_URL = f"https://www.odwb.be/api/explore/v2.1/catalog/datasets/{ODWB_DATASET_ID}/exports/csv?limit=-1&delimiter=%3B"
 
 
+# =========================
+# Helpers
+# =========================
 def euro(x: float) -> str:
     try:
         x = float(x)
@@ -34,11 +43,29 @@ def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
-# ----------------------------
-# PARAMS (impacts expert)
-# ----------------------------
+def today_iso() -> str:
+    return date.today().isoformat()
+
+
+def parse_float(x, default=0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def parse_int(x, default=0) -> int:
+    try:
+        return int(float(x))
+    except Exception:
+        return default
+
+
+# =========================
+# Paramètres (tu peux ajuster dans l’onglet Paramètres)
+# =========================
 DEFAULT_PARAMS = {
-    # Terrain €/m² automatique (Wallonie - bases)
+    # Terrain €/m² auto (bases par province)
     "terrain_Hainaut": 60,
     "terrain_Namur": 90,
     "terrain_Liege": 85,
@@ -53,6 +80,10 @@ DEFAULT_PARAMS = {
     # Coef expert (%)
     "coef_expert_min": -3.0,
     "coef_expert_max": 3.0,
+
+    # Vente rapide / lente
+    "vente_rapide_pct": -0.08,
+    "vente_lente_pct": 0.05,
 
     # Humidité
     "hum_non": 0,
@@ -71,7 +102,15 @@ DEFAULT_PARAMS = {
     "poste_moyen": -6000,
     "poste_mauvais": -18000,
 
-    # Equipements (bonus)
+    # Isolation (Bonne/Moyenne/Mauvaise)
+    "isolation_bonne": 6000,
+    "isolation_moyenne": 0,
+    "isolation_mauvaise": -8000,
+
+    # Cave surface
+    "cave_eur_m2": 120,
+
+    # Equipements
     "eq_pv": 6000,
     "eq_clim": 2500,
     "eq_vmc": 2000,
@@ -79,6 +118,11 @@ DEFAULT_PARAMS = {
     "eq_domotique": 2500,
     "eq_piscine": 15000,
     "eq_poele_pellet": 2000,
+
+    # Façades
+    "facades_2": 0,
+    "facades_3": 10000,
+    "facades_4": 20000,
 
     # Caractéristiques
     "impact_par_chambre": 8000,
@@ -88,11 +132,11 @@ DEFAULT_PARAMS = {
     "impact_balcon": 5000,
     "impact_terrasse": 10000,
     "impact_jardin": 12000,
-    "impact_cave": 4000,
+
     "grenier_amenageable_base": 5000,
     "grenier_amenageable_eur_m2": 120,
 
-    # Vitrage / chauffage / cuisine / sdb / toiture / PEB (simple mais utile)
+    # Vitrage / chauffage / cuisine / sdb / toiture / PEB
     "vitrage_simple": -8000,
     "vitrage_double_ancien": -3000,
     "vitrage_double_recent": 0,
@@ -113,8 +157,8 @@ DEFAULT_PARAMS = {
     "sdb_remplacer": -9000,
 
     "toit_forfait": 18000,
-    "toit_moyen_coeff": 0.5,   # Moyenne = moitié du forfait
-    "toit_factor": 0.7,        # impact appliqué
+    "toit_moyen_coeff": 0.5,
+    "toit_factor": 0.7,
 
     "peb_A": 6000,
     "peb_B": 3000,
@@ -129,28 +173,26 @@ DEFAULT_PARAMS = {
 }
 
 
-# ----------------------------
-# OPEN DATA (comparateurs)
-# ----------------------------
+# =========================
+# Open Data
+# =========================
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
 def load_odwb_prices_csv() -> pd.DataFrame:
-    """
-    Télécharge l'export CSV ODWB (dataset 234002). C'est du CSV ';'.
-    """
     r = requests.get(ODWB_EXPORT_CSV_URL, timeout=30)
     r.raise_for_status()
     content = r.content.decode("utf-8", errors="replace")
     df = pd.read_csv(BytesIO(content.encode("utf-8")), sep=";")
-    # Nettoyage colonnes
     df.columns = [c.strip().lower() for c in df.columns]
     return df
 
 
+def filter_wallonie(df: pd.DataFrame) -> pd.DataFrame:
+    if "region" in df.columns:
+        return df[df["region"].astype(str).str.upper().str.contains("WALL")].copy()
+    return df.copy()
+
+
 def detect_columns(df: pd.DataFrame):
-    """
-    Essaye de deviner les colonnes utiles (commune, annee, type, prix median, prix m2, transactions)
-    car le schéma peut varier selon publication.
-    """
     cols = set(df.columns)
 
     def pick(candidates):
@@ -162,23 +204,9 @@ def detect_columns(df: pd.DataFrame):
     commune = pick(["commune", "commune_nom", "nom_commune", "localite", "municipalite"])
     annee = pick(["annee", "year"])
     typ = pick(["type", "type_bien", "bien", "categorie", "typologie"])
-    # prix
     median_price = pick(["prix_median", "median_price", "median", "prixmedian", "prix_median_eur"])
-    median_m2 = pick(["prix_median_m2", "median_m2", "prix_m2_median", "prix_m2"])
     transactions = pick(["transactions", "nb_transactions", "nombre_transactions", "volume"])
-
-    return commune, annee, typ, median_price, median_m2, transactions
-
-
-def filter_wallonie(df: pd.DataFrame) -> pd.DataFrame:
-    # Si une colonne region existe, on filtre WALLONIE
-    if "region" in df.columns:
-        return df[df["region"].astype(str).str.upper().str.contains("WALL")].copy()
-    return df.copy()
-
-
-def normalize_str(s: str) -> str:
-    return (s or "").strip().lower()
+    return commune, annee, typ, median_price, transactions
 
 
 def get_communes_list(df: pd.DataFrame, col_commune: str) -> list:
@@ -197,6 +225,57 @@ def latest_year(df: pd.DataFrame, col_year: str) -> int | None:
     return int(yrs.max())
 
 
+def odwb_series_commune(df: pd.DataFrame, col_commune: str, col_year: str, col_type: str | None,
+                        col_median: str | None, commune: str, wanted_type_keyword: str) -> pd.DataFrame:
+    """
+    Retourne une série (année -> prix médian) pour une commune, filtrée par type si possible.
+    """
+    if not (col_commune and col_year and col_median):
+        return pd.DataFrame(columns=["annee", "prix_median"])
+
+    dff = df[df[col_commune].astype(str).str.strip() == str(commune).strip()].copy()
+    if col_type:
+        dff = dff[dff[col_type].astype(str).str.lower().str.contains(wanted_type_keyword)].copy()
+
+    dff["annee_num"] = pd.to_numeric(dff[col_year], errors="coerce")
+    dff["prix_num"] = pd.to_numeric(dff[col_median], errors="coerce")
+
+    dff = dff.dropna(subset=["annee_num", "prix_num"])
+    if len(dff) == 0:
+        return pd.DataFrame(columns=["annee", "prix_median"])
+
+    # s’il y a plusieurs lignes pour une année, on prend la moyenne
+    out = dff.groupby("annee_num")["prix_num"].mean().reset_index()
+    out.columns = ["annee", "prix_median"]
+    out = out.sort_values("annee")
+    return out
+
+
+def evolution_pct(series_df: pd.DataFrame, years_back: int) -> float | None:
+    """
+    Calcule l'évolution % entre dernière année et (dernière - years_back)
+    """
+    if series_df is None or len(series_df) < 2:
+        return None
+    last_year = int(series_df["annee"].max())
+    target_year = last_year - years_back
+    last_val = float(series_df[series_df["annee"] == last_year]["prix_median"].iloc[0])
+
+    # année la plus proche <= target_year
+    older = series_df[series_df["annee"] <= target_year]
+    if len(older) == 0:
+        return None
+    old_year = int(older["annee"].max())
+    old_val = float(older[older["annee"] == old_year]["prix_median"].iloc[0])
+
+    if old_val <= 0:
+        return None
+    return (last_val / old_val - 1.0) * 100.0
+
+
+# =========================
+# Calculs Expert
+# =========================
 def terrain_auto(province: str, terrain_m2: float, params: dict) -> float:
     key = f"terrain_{province}"
     return float(terrain_m2) * float(params.get(key, 80))
@@ -215,16 +294,9 @@ def locatif_mensuel(valeur: float, type_bien: str, params: dict) -> float:
     return (valeur * rb) / 12.0
 
 
-# ----------------------------
-# IMPACTS EXPERT
-# ----------------------------
 def impact_humidite(hum: str, params: dict) -> float:
-    m = {
-        "Non": float(params["hum_non"]),
-        "Legere": float(params["hum_legere"]),
-        "Importante": float(params["hum_importante"]),
-    }
-    return float(m.get(hum, 0.0))
+    m = {"Non": params["hum_non"], "Legere": params["hum_legere"], "Importante": params["hum_importante"]}
+    return float(m.get(hum, 0))
 
 
 def impact_annee(annee: int, params: dict) -> float:
@@ -242,12 +314,20 @@ def impact_annee(annee: int, params: dict) -> float:
 
 
 def impact_poste(etat: str, params: dict) -> float:
-    m = {
-        "Bon": float(params["poste_bon"]),
-        "Moyen": float(params["poste_moyen"]),
-        "Mauvais": float(params["poste_mauvais"]),
-    }
-    return float(m.get(etat, 0.0))
+    m = {"Bon": params["poste_bon"], "Moyen": params["poste_moyen"], "Mauvais": params["poste_mauvais"]}
+    return float(m.get(etat, 0))
+
+
+def impact_isolation(etat: str, params: dict) -> float:
+    m = {"Bonne": params["isolation_bonne"], "Moyenne": params["isolation_moyenne"], "Mauvaise": params["isolation_mauvaise"]}
+    return float(m.get(etat, 0))
+
+
+def impact_cave_surface(surface_cave_m2: float, params: dict) -> float:
+    s = float(surface_cave_m2 or 0.0)
+    if s <= 0:
+        return 0.0
+    return s * float(params["cave_eur_m2"])
 
 
 def impact_equipements(eq: dict, params: dict) -> float:
@@ -262,42 +342,28 @@ def impact_equipements(eq: dict, params: dict) -> float:
     return total
 
 
+def impact_facades(nb: int, params: dict) -> float:
+    mapping = {2: params["facades_2"], 3: params["facades_3"], 4: params["facades_4"]}
+    return float(mapping.get(int(nb), 0.0))
+
+
 def impact_vitrage(v: str, params: dict) -> float:
-    m = {
-        "Simple": float(params["vitrage_simple"]),
-        "Double ancien": float(params["vitrage_double_ancien"]),
-        "Double recent": float(params["vitrage_double_recent"]),
-        "Triple": float(params["vitrage_triple"]),
-    }
+    m = {"Simple": params["vitrage_simple"], "Double ancien": params["vitrage_double_ancien"], "Double recent": params["vitrage_double_recent"], "Triple": params["vitrage_triple"]}
     return float(m.get(v, 0.0))
 
 
 def impact_chauffage(c: str, params: dict) -> float:
-    m = {
-        "Pompe a chaleur": float(params["chauff_pac"]),
-        "Gaz condensation": float(params["chauff_gaz_cond"]),
-        "Mazout": float(params["chauff_mazout"]),
-        "Electrique": float(params["chauff_electrique"]),
-        "Ancien systeme / poele seul": float(params["chauff_ancien"]),
-    }
+    m = {"Pompe a chaleur": params["chauff_pac"], "Gaz condensation": params["chauff_gaz_cond"], "Mazout": params["chauff_mazout"], "Electrique": params["chauff_electrique"], "Ancien systeme / poele seul": params["chauff_ancien"]}
     return float(m.get(c, 0.0))
 
 
 def impact_cuisine(etat: str, params: dict) -> float:
-    m = {
-        "Bonne": float(params["cuisine_bonne"]),
-        "A moderniser": float(params["cuisine_moderniser"]),
-        "A remplacer": float(params["cuisine_remplacer"]),
-    }
+    m = {"Bonne": params["cuisine_bonne"], "A moderniser": params["cuisine_moderniser"], "A remplacer": params["cuisine_remplacer"]}
     return float(m.get(etat, 0.0))
 
 
 def impact_sdb(etat: str, params: dict) -> float:
-    m = {
-        "Bonne": float(params["sdb_bonne"]),
-        "A moderniser": float(params["sdb_moderniser"]),
-        "A remplacer": float(params["sdb_remplacer"]),
-    }
+    m = {"Bonne": params["sdb_bonne"], "A moderniser": params["sdb_moderniser"], "A remplacer": params["sdb_remplacer"]}
     return float(m.get(etat, 0.0))
 
 
@@ -312,15 +378,7 @@ def impact_toiture(etat: str, params: dict) -> float:
 
 def impact_peb(letter: str, params: dict) -> float:
     l = (letter or "C").strip().upper()
-    m = {
-        "A": float(params["peb_A"]),
-        "B": float(params["peb_B"]),
-        "C": float(params["peb_C"]),
-        "D": float(params["peb_D"]),
-        "E": float(params["peb_E"]),
-        "F": float(params["peb_F"]),
-        "G": float(params["peb_G"]),
-    }
+    m = {"A": params["peb_A"], "B": params["peb_B"], "C": params["peb_C"], "D": params["peb_D"], "E": params["peb_E"], "F": params["peb_F"], "G": params["peb_G"]}
     return float(m.get(l, 0.0))
 
 
@@ -343,17 +401,16 @@ def impact_annexes(bien: dict, params: dict) -> float:
     if bien["balcon"]: total += float(params["impact_balcon"])
     if bien["terrasse"]: total += float(params["impact_terrasse"])
     if bien["jardin"]: total += float(params["impact_jardin"])
-    if bien["cave"]: total += float(params["impact_cave"])
     if bien["grenier_amenageable"]:
         total += float(params["grenier_amenageable_base"]) + float(bien["grenier_amenageable_surface_m2"]) * float(params["grenier_amenageable_eur_m2"])
     return total
 
 
 def indice_global(bien: dict) -> float:
-    # indice simple /10 basé sur postes + humidité + PEB (utilisé pour fourchette)
     map_etat = {"Bon": 9, "Moyen": 6, "Mauvais": 3}
     hum_map = {"Non": 10, "Legere": 6, "Importante": 2}
     peb_map = {"A": 10, "B": 9, "C": 8, "D": 6, "E": 4, "F": 3, "G": 2}
+    iso_map = {"Bonne": 9, "Moyenne": 6, "Mauvaise": 3}
 
     notes = [
         map_etat.get(bien["etat_maconnerie"], 6),
@@ -364,6 +421,9 @@ def indice_global(bien: dict) -> float:
         map_etat.get(bien["etat_facades"], 6),
         hum_map.get(bien["humidite"], 6),
         peb_map.get(bien["peb_lettre"], 8),
+        iso_map.get(bien["isolation_toiture"], 6),
+        iso_map.get(bien["isolation_murs"], 6),
+        iso_map.get(bien["isolation_sol"], 6),
     ]
     return float(mean(notes))
 
@@ -382,9 +442,9 @@ def fourchette(valeur: float, indice: float, params: dict):
     return valeur * (1 - low_pct), valeur * (1 + high_pct), low_pct, high_pct
 
 
-# ----------------------------
-# PDF 3 pages
-# ----------------------------
+# =========================
+# PDF (3 pages)
+# =========================
 def draw_header(c: canvas.Canvas, title: str, subtitle: str):
     w, h = A4
     c.setFont("Helvetica-Bold", 14)
@@ -398,8 +458,9 @@ def draw_header(c: canvas.Canvas, title: str, subtitle: str):
     c.line(40, h - 130, w - 40, h - 130)
 
 
-def build_pdf(bien, comparateurs, impacts, valeur_base, valeur_terrain, valeur_finale,
-              loyer_mensuel, indice, low, high, coef_expert_pct, justif) -> bytes:
+def build_pdf(bien, client, comp, evol5, evol10, impacts, valeur_base, valeur_terrain,
+              valeur_finale, low, high, loyer_mensuel, vente_rapide, vente_lente,
+              indice, coef_expert_pct, justif) -> bytes:
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     w, h = A4
@@ -410,37 +471,44 @@ def build_pdf(bien, comparateurs, impacts, valeur_base, valeur_terrain, valeur_f
     c.setFont("Helvetica-Bold", 12)
     c.drawString(40, y, "Bien"); y -= 18
     c.setFont("Helvetica", 10)
-    c.drawString(55, y, f"Client: {safe_text(bien['client'], 60) or '-'}"); y -= 14
+
+    c.drawString(55, y, f"Client: {safe_text(client.get('nom',''), 60) or safe_text(bien.get('client_nom',''),60) or '-'}"); y -= 14
     c.drawString(55, y, f"Adresse: {safe_text(bien['adresse'], 120) or '-'}"); y -= 14
-    c.drawString(55, y, f"Commune (comparateurs): {safe_text(bien['commune'], 60) or '-'}"); y -= 14
+    c.drawString(55, y, f"Commune (marché): {safe_text(bien['commune'], 60) or '-'}"); y -= 14
     c.drawString(55, y, f"Province: {bien['province']}  |  Type: {bien['type_bien']}"); y -= 14
-    c.drawString(55, y, f"Année construction: {bien['annee_construction'] or '-'}"); y -= 14
+    c.drawString(55, y, f"Année construction: {bien['annee_construction'] or '-'}  |  Façades: {int(bien['nb_facades'])}"); y -= 14
 
     c.drawString(55, y, f"Surface habitable: {bien['surface_habitable']:.0f} m²  |  Surface totale: {bien['surface_totale']:.0f} m²"); y -= 14
     if bien["type_bien"] == "Maison":
         c.drawString(55, y, f"Terrain: {bien['terrain_m2']:.0f} m²  |  Valeur terrain auto: {euro(valeur_terrain)}"); y -= 14
 
-    # Surfaces par étage
     if bien["surfaces_etages"] and sum(bien["surfaces_etages"]) > 0:
         c.drawString(55, y, "Surfaces par étage: " + " / ".join([f"{s:.0f} m²" for s in bien["surfaces_etages"]]))
         y -= 14
 
-    c.drawString(55, y, f"Humidité: {bien['humidite']}  |  PEB: {bien['peb_lettre']}" + (f" ({bien['peb_kwh']:.0f})" if bien["peb_kwh"] else "")); y -= 14
+    c.drawString(55, y, f"Isolation toiture/murs/sol: {bien['isolation_toiture']} / {bien['isolation_murs']} / {bien['isolation_sol']}"); y -= 14
+    c.drawString(55, y, f"Humidité: {bien['humidite']}  |  Cave: {bien.get('surface_cave_m2', 0):.0f} m²"); y -= 14
+
+    c.drawString(55, y, f"PEB: {bien['peb_lettre']}" + (f" ({bien['peb_kwh']:.0f})" if bien["peb_kwh"] else "")); y -= 14
     c.drawString(55, y, f"Chauffage: {bien['chauffage']}  |  Vitrage: {bien['vitrage']}"); y -= 14
-    c.drawString(55, y, f"Cuisine: {bien['etat_cuisine']}  |  Salle de bain: {bien['etat_sdb']}"); y -= 14
 
-    c.drawString(55, y, f"Chambres: {bien['chambres']}  |  SDB: {bien['sdb']}"); y -= 14
-    c.drawString(55, y, f"Garage: {'Oui' if bien['garage'] else 'Non'}  |  Parking: {bien['nb_places_parking']}"); y -= 14
-    c.drawString(55, y, f"Terrasse: {'Oui' if bien['terrasse'] else 'Non'}  |  Balcon: {'Oui' if bien['balcon'] else 'Non'}"); y -= 14
-    c.drawString(55, y, f"Jardin: {'Oui' if bien['jardin'] else 'Non'}  |  Cave: {'Oui' if bien['cave'] else 'Non'}"); y -= 14
-
-    y -= 6
+    y -= 4
     c.setFont("Helvetica-Bold", 14)
     c.drawString(40, y, f"Valeur finale estimée: {euro(valeur_finale)}"); y -= 18
     c.setFont("Helvetica", 11)
     c.drawString(40, y, f"Fourchette conseillée: {euro(low)}  →  {euro(high)}"); y -= 16
+    c.drawString(40, y, f"Vente rapide: {euro(vente_rapide)}  |  Vente lente: {euro(vente_lente)}"); y -= 16
     c.drawString(40, y, f"Valeur locative mensuelle (indicative): {euro(loyer_mensuel)}"); y -= 16
-    c.drawString(40, y, f"Indice global: {indice:.1f}/10   |   Coef expert: {coef_expert_pct:+.1f}%"); y -= 16
+
+    c.setFont("Helvetica", 10)
+    if comp.get("ok"):
+        c.drawString(40, y, f"Marché (open data): année {comp.get('year','-')} | Evolution 5 ans: {('%.1f' % evol5 + '%') if evol5 is not None else '—'} | Evolution 10 ans: {('%.1f' % evol10 + '%') if evol10 is not None else '—'}")
+        y -= 14
+    else:
+        c.drawString(40, y, "Marché (open data): données non trouvées pour cette commune / type.")
+        y -= 14
+
+    c.drawString(40, y, f"Indice global: {indice:.1f}/10   |   Coef expert: {coef_expert_pct:+.1f}%"); y -= 14
     c.setFont("Helvetica-Oblique", 9)
     c.drawString(40, y, f"Justification coef expert: {safe_text(justif, 110) or '-'}"); y -= 18
 
@@ -448,25 +516,11 @@ def build_pdf(bien, comparateurs, impacts, valeur_base, valeur_terrain, valeur_f
     c.drawString(40, 40, "Document indicatif - basé sur open data (WalStat/Statbel) + analyse technique.")
     c.showPage()
 
-    # Page 2: Détail calcul
-    draw_header(c, "Détail des calculs", "Impacts expert (page 2/3)")
+    # Page 2
+    draw_header(c, "Détail des calculs", "Comparateurs + impacts (page 2/3)")
     y = h - 165
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(40, y, "Base marché (comparateurs open data)"); y -= 18
-    c.setFont("Helvetica", 10)
-
-    if comparateurs.get("ok"):
-        c.drawString(55, y, f"Année données: {comparateurs.get('year') or '-'}"); y -= 14
-        c.drawString(55, y, f"Prix médian maison commune: {euro(comparateurs.get('median_house', 0))}"); y -= 14
-        c.drawString(55, y, f"Prix médian appartement commune: {euro(comparateurs.get('median_apartment', 0))}"); y -= 14
-        if comparateurs.get("transactions") is not None:
-            c.drawString(55, y, f"Transactions (indicatif): {comparateurs.get('transactions')}"); y -= 14
-    else:
-        c.drawString(55, y, "Comparateurs: données non trouvées (vérifier l'orthographe de la commune)."); y -= 14
-
-    y -= 6
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(40, y, "Valeur de base"); y -= 18
+    c.drawString(40, y, "Valeur de base (marché)"); y -= 18
     c.setFont("Helvetica", 10)
     c.drawString(55, y, f"Valeur base (commune/type + surfaces): {euro(valeur_base)}"); y -= 14
     if bien["type_bien"] == "Maison":
@@ -488,24 +542,22 @@ def build_pdf(bien, comparateurs, impacts, valeur_base, valeur_terrain, valeur_f
 
     c.showPage()
 
-    # Page 3: Méthodologie
+    # Page 3
     draw_header(c, "Méthodologie", "Explications (page 3/3)")
     y = h - 165
     c.setFont("Helvetica", 10)
     txt = [
         "1) Comparateurs automatiques: prix médians par commune (open data WalStat/Statbel via ODWB).",
-        "2) Valeur de base: combinaison médiane commune + surfaces (habitable/totale) et type de bien.",
-        "3) Expertise technique: impacts chiffrés par poste (toiture, élec, humidité, etc.) + équipements.",
-        "4) Valeur terrain: estimation automatique selon province (base interne paramétrable).",
-        "5) Valeur locative: rendement brut indicatif selon type de bien.",
-        "6) Coef expert: ajustement final (rue, nuisances, vue, attractivité, rareté) + justification.",
-        "",
-        "Note: l'open data est souvent au niveau COMMUNE (pas toujours au niveau village/quartier).",
-        "Pour du micro-quartier, encode les ventes réelles dans l'historique de l'app.",
+        "2) Evolution du marché: calcul sur la série historique (commune + type) si disponible.",
+        "3) Valeur de base: médiane commune ajustée par surfaces.",
+        "4) Expertise technique: impacts chiffrés par poste (toiture, électricité, humidité, isolation...).",
+        "5) Terrain: estimation automatique selon province (base interne paramétrable).",
+        "6) Valeur locative: rendement brut indicatif selon type de bien.",
+        "7) Vente rapide / lente: marges paramétrables pour stratégie vendeur.",
+        "Note: l'open data est souvent au niveau COMMUNE (pas toujours village/quartier).",
     ]
     for line in txt:
-        c.drawString(40, y, line)
-        y -= 14
+        c.drawString(40, y, line); y -= 14
 
     c.setFont("Helvetica-Oblique", 8)
     c.drawString(40, 40, "Outil interne - La Priorite Immobiliere.")
@@ -515,36 +567,166 @@ def build_pdf(bien, comparateurs, impacts, valeur_base, valeur_terrain, valeur_f
     return buf.getvalue()
 
 
-# ----------------------------
-# STREAMLIT UI
-# ----------------------------
-st.set_page_config(page_title="Estimateur Expert - La Priorite Immobiliere", layout="wide")
-st.title("Estimateur Expert (Wallonie) - La Priorite Immobiliere")
+# =========================
+# “DB” simple (CRM + historique) en mémoire + import/export CSV
+# =========================
+CLIENTS_COLS = [
+    "client_id", "nom", "telephone", "email", "notes", "date_creation"
+]
+BIENS_COLS = [
+    "bien_id", "client_id", "adresse", "commune", "province", "type_bien",
+    "surface_habitable", "surface_totale", "terrain_m2", "nb_facades",
+    "peb_lettre", "peb_kwh", "statut", "notes", "date_creation"
+]
+ESTIM_COLS = [
+    "estimation_id", "bien_id", "client_id", "date_estimation",
+    "valeur_base", "valeur_terrain", "total_impacts", "coef_expert_pct",
+    "valeur_finale", "fourchette_basse", "fourchette_haute",
+    "vente_rapide", "vente_lente", "loyer_mensuel",
+    "indice_global", "commune_marche", "annee_marche", "evol_5ans", "evol_10ans"
+]
 
-if "params" not in st.session_state:
-    st.session_state["params"] = DEFAULT_PARAMS.copy()
 
+def ensure_tables():
+    if "params" not in st.session_state:
+        st.session_state["params"] = DEFAULT_PARAMS.copy()
+    if "clients" not in st.session_state:
+        st.session_state["clients"] = pd.DataFrame(columns=CLIENTS_COLS)
+    if "biens" not in st.session_state:
+        st.session_state["biens"] = pd.DataFrame(columns=BIENS_COLS)
+    if "estimations" not in st.session_state:
+        st.session_state["estimations"] = pd.DataFrame(columns=ESTIM_COLS)
+
+
+def add_client(nom, telephone, email, notes):
+    df = st.session_state["clients"]
+    row = {
+        "client_id": str(uuid.uuid4()),
+        "nom": nom.strip(),
+        "telephone": telephone.strip(),
+        "email": email.strip(),
+        "notes": notes.strip(),
+        "date_creation": today_iso(),
+    }
+    st.session_state["clients"] = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    return row["client_id"]
+
+
+def add_bien(client_id, adresse, commune, province, type_bien,
+             surface_habitable, surface_totale, terrain_m2, nb_facades,
+             peb_lettre, peb_kwh, statut, notes):
+    df = st.session_state["biens"]
+    row = {
+        "bien_id": str(uuid.uuid4()),
+        "client_id": client_id,
+        "adresse": adresse.strip(),
+        "commune": commune.strip(),
+        "province": province,
+        "type_bien": type_bien,
+        "surface_habitable": float(surface_habitable),
+        "surface_totale": float(surface_totale),
+        "terrain_m2": float(terrain_m2),
+        "nb_facades": int(nb_facades),
+        "peb_lettre": peb_lettre,
+        "peb_kwh": float(peb_kwh),
+        "statut": statut,
+        "notes": notes.strip(),
+        "date_creation": today_iso(),
+    }
+    st.session_state["biens"] = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    return row["bien_id"]
+
+
+def add_estimation(row: dict):
+    df = st.session_state["estimations"]
+    st.session_state["estimations"] = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+
+
+def export_all_to_zip_csv():
+    # (simple: 3 CSV séparés)
+    clients = st.session_state["clients"].copy()
+    biens = st.session_state["biens"].copy()
+    estim = st.session_state["estimations"].copy()
+
+    out = BytesIO()
+    # On met les 3 CSV dans un seul fichier “multi-CSV” séparé
+    # (format simple: sections + CSV)
+    out.write(b"###CLIENTS###\n")
+    out.write(clients.to_csv(index=False).encode("utf-8"))
+    out.write(b"\n###BIENS###\n")
+    out.write(biens.to_csv(index=False).encode("utf-8"))
+    out.write(b"\n###ESTIMATIONS###\n")
+    out.write(estim.to_csv(index=False).encode("utf-8"))
+    out.seek(0)
+    return out.getvalue()
+
+
+def import_from_multi_csv(content: bytes):
+    text = content.decode("utf-8", errors="replace")
+    if "###CLIENTS###" not in text or "###BIENS###" not in text or "###ESTIMATIONS###" not in text:
+        raise ValueError("Fichier invalide (format export attendu).")
+
+    part_clients = text.split("###CLIENTS###\n", 1)[1].split("\n###BIENS###\n", 1)[0]
+    part_biens = text.split("\n###BIENS###\n", 1)[1].split("\n###ESTIMATIONS###\n", 1)[0]
+    part_estim = text.split("\n###ESTIMATIONS###\n", 1)[1]
+
+    cdf = pd.read_csv(BytesIO(part_clients.encode("utf-8")))
+    bdf = pd.read_csv(BytesIO(part_biens.encode("utf-8")))
+    edf = pd.read_csv(BytesIO(part_estim.encode("utf-8")))
+
+    # Harmoniser colonnes
+    for col in CLIENTS_COLS:
+        if col not in cdf.columns:
+            cdf[col] = ""
+    for col in BIENS_COLS:
+        if col not in bdf.columns:
+            bdf[col] = ""
+    for col in ESTIM_COLS:
+        if col not in edf.columns:
+            edf[col] = ""
+
+    st.session_state["clients"] = cdf[CLIENTS_COLS]
+    st.session_state["biens"] = bdf[BIENS_COLS]
+    st.session_state["estimations"] = edf[ESTIM_COLS]
+
+
+# =========================
+# UI
+# =========================
+st.set_page_config(page_title="Logiciel Agence - La Priorite Immobiliere", layout="wide")
+ensure_tables()
 params = st.session_state["params"]
 
-tabs = st.tabs(["1) Encodage bien", "2) Comparateurs (Open data)", "3) Synthèse + PDF", "4) Paramètres"])
+st.title("Logiciel Agence (Wallonie) - La Priorite Immobiliere")
+tabs = st.tabs(["1) Estimation Expert", "2) Marché & évolution", "3) Historique estimations", "4) CRM Clients", "5) Fiches biens", "6) Paramètres / Export"])
 
 
-# Sidebar dossier
+# =========================
+# Sidebar (encodage estimation)
+# =========================
 with st.sidebar:
-    st.subheader("Dossier")
-    client = st.text_input("Client", value="")
-    adresse = st.text_input("Adresse complète", value="")
+    st.subheader("Client (optionnel)")
+    client_nom = st.text_input("Nom client (si pas CRM)", value="")
+    client_tel = st.text_input("Téléphone", value="")
+    client_email = st.text_input("Email", value="")
+    client_notes = st.text_area("Notes client", value="", height=70)
 
+    st.subheader("Bien")
+    adresse = st.text_input("Adresse complète", value="")
     province = st.selectbox("Province", ["Hainaut", "Namur", "Liege", "Brabant_wallon", "Luxembourg"])
     type_bien = st.selectbox("Type de bien", ["Maison", "Appartement", "Commerce"])
+
+    st.subheader("Marché (comparateurs)")
+    commune = st.text_input("Commune (ex: Charleroi)", value="")
 
     st.subheader("Surfaces")
     surface_habitable = st.number_input("Surface habitable (m²)", min_value=0.0, value=100.0, step=1.0)
     surface_totale = st.number_input("Surface totale (m²)", min_value=1.0, value=120.0, step=1.0)
-
     terrain_m2 = 0.0
     if type_bien == "Maison":
         terrain_m2 = st.number_input("Terrain (m²)", min_value=0.0, value=0.0, step=10.0)
+
+    nb_facades = st.selectbox("Nombre de façades", [2, 3, 4], index=0)
 
     st.subheader("Surfaces par étage")
     nb_etages = st.number_input("Nombre d'étages", min_value=1, max_value=10, value=1, step=1)
@@ -554,16 +736,19 @@ with st.sidebar:
             st.number_input(f"Surface étage {i+1} (m²)", min_value=0.0, value=0.0, step=5.0, key=f"surf_{i}")
         )
 
-    st.subheader("Construction")
+    st.subheader("Construction / état")
     annee_construction = st.number_input("Année de construction", min_value=0, max_value=2100, value=0, step=1)
+    humidite = st.selectbox("Humidité", ["Non", "Legere", "Importante"], index=0)
 
-    st.subheader("Humidité")
-    humidite = st.selectbox("Présence d'humidité", ["Non", "Legere", "Importante"], index=0)
+    st.subheader("Isolation")
+    isolation_toiture = st.selectbox("Isolation toiture", ["Bonne", "Moyenne", "Mauvaise"], index=1)
+    isolation_murs = st.selectbox("Isolation murs", ["Bonne", "Moyenne", "Mauvaise"], index=1)
+    isolation_sol = st.selectbox("Isolation sol", ["Bonne", "Moyenne", "Mauvaise"], index=1)
 
-    st.subheader("Techniques")
+    st.subheader("Technique")
     toiture_etat = st.selectbox("Toiture (état)", ["Parfaite", "Moyenne", "Mauvaise"], index=0)
     chauffage = st.selectbox("Chauffage", ["Pompe a chaleur", "Gaz condensation", "Mazout", "Electrique", "Ancien systeme / poele seul"], index=1)
-    vitrage = st.selectbox("Châssis/Vitrage", ["Simple", "Double ancien", "Double recent", "Triple"], index=2)
+    vitrage = st.selectbox("Vitrage", ["Simple", "Double ancien", "Double recent", "Triple"], index=2)
 
     peb_lettre = st.selectbox("PEB (lettre)", ["A", "B", "C", "D", "E", "F", "G"], index=2)
     peb_kwh = st.number_input("PEB (kWh/m².an) optionnel", min_value=0.0, value=0.0, step=1.0)
@@ -580,16 +765,16 @@ with st.sidebar:
     etat_facades = st.selectbox("Façades", ["Bon", "Moyen", "Mauvais"], index=0)
 
     st.subheader("Pièces")
-    chambres = st.number_input("Nombre de chambres", min_value=0, value=2, step=1)
-    sdb = st.number_input("Nombre de salles de bain", min_value=0, value=1, step=1)
+    chambres = st.number_input("Chambres", min_value=0, value=2, step=1)
+    sdb = st.number_input("Salles de bain (nb)", min_value=0, value=1, step=1)
 
     st.subheader("Annexes")
+    surface_cave_m2 = st.number_input("Surface cave (m²)", min_value=0.0, value=0.0, step=5.0)
     nb_places_parking = st.number_input("Places parking", min_value=0, value=0, step=1)
     garage = st.checkbox("Garage", value=False)
     balcon = st.checkbox("Balcon", value=False)
     terrasse = st.checkbox("Terrasse", value=False)
     jardin = st.checkbox("Jardin", value=False)
-    cave = st.checkbox("Cave", value=False)
     grenier_amenageable = st.checkbox("Grenier aménageable", value=False)
     grenier_amenageable_surface_m2 = st.number_input("Surface grenier aménageable (m²)", min_value=0.0, value=0.0, step=5.0, disabled=not grenier_amenageable)
 
@@ -609,8 +794,13 @@ with st.sidebar:
 
 # Bien dict
 bien = {
-    "client": client,
+    "client_nom": client_nom,
+    "client_tel": client_tel,
+    "client_email": client_email,
+    "client_notes": client_notes,
+
     "adresse": adresse,
+    "commune": commune.strip(),
     "province": province,
     "type_bien": type_bien,
 
@@ -618,10 +808,15 @@ bien = {
     "surface_totale": float(surface_totale),
     "terrain_m2": float(terrain_m2),
 
+    "nb_facades": int(nb_facades),
     "surfaces_etages": [float(x) for x in surfaces_etages],
 
     "annee_construction": int(annee_construction),
     "humidite": humidite,
+
+    "isolation_toiture": isolation_toiture,
+    "isolation_murs": isolation_murs,
+    "isolation_sol": isolation_sol,
 
     "toiture_etat": toiture_etat,
     "chauffage": chauffage,
@@ -641,12 +836,12 @@ bien = {
     "chambres": int(chambres),
     "sdb": int(sdb),
 
+    "surface_cave_m2": float(surface_cave_m2),
     "nb_places_parking": int(nb_places_parking),
     "garage": bool(garage),
     "balcon": bool(balcon),
     "terrasse": bool(terrasse),
     "jardin": bool(jardin),
-    "cave": bool(cave),
     "grenier_amenageable": bool(grenier_amenageable),
     "grenier_amenageable_surface_m2": float(grenier_amenageable_surface_m2),
 
@@ -665,175 +860,62 @@ bien = {
 }
 
 
-# ----------------------------
-# TAB 1: Encodage
-# ----------------------------
+# =========================
+# 1) Estimation Expert
+# =========================
 with tabs[0]:
-    st.subheader("Résumé encodage")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Surface habitable", f"{bien['surface_habitable']:.0f} m²")
-    c2.metric("Surface totale", f"{bien['surface_totale']:.0f} m²")
-    if type_bien == "Maison":
-        c3.metric("Terrain", f"{bien['terrain_m2']:.0f} m²")
-    else:
-        c3.metric("Terrain", "—")
+    st.subheader("Estimation Expert")
 
-    if sum(bien["surfaces_etages"]) > 0:
-        st.write("Surfaces par étage :", " / ".join([f"{s:.0f} m²" for s in bien["surfaces_etages"]]))
-        if abs(sum(bien["surfaces_etages"]) - bien["surface_totale"]) > 5:
-            st.warning("⚠️ Surfaces par étage ≠ surface totale (écart > 5 m²).")
+    # Open data + série
+    comp = {"ok": False, "year": None}
+    evol5 = None
+    evol10 = None
+    valeur_base = bien["surface_totale"] * 2000  # fallback
 
+    if bien["commune"]:
+        try:
+            df = filter_wallonie(load_odwb_prices_csv())
+            col_commune, col_year, col_type, col_median, col_tx = detect_columns(df)
+            if col_commune and col_year and col_median:
+                want_kw = "maison" if type_bien == "Maison" else ("appart" if type_bien == "Appartement" else "commerce")
+                series = odwb_series_commune(df, col_commune, col_year, col_type, col_median, bien["commune"], want_kw)
 
-# ----------------------------
-# TAB 2: Comparateurs Open Data
-# ----------------------------
-with tabs[1]:
-    st.subheader("Comparateurs automatiques (Open Data Wallonie)")
-    st.caption("Données WalStat/Statbel via ODWB (niveau commune).")
+                if len(series) > 0:
+                    last_year = int(series["annee"].max())
+                    last_val = float(series[series["annee"] == last_year]["prix_median"].iloc[0])
+                    comp = {"ok": True, "year": last_year}
 
-    try:
-        df = load_odwb_prices_csv()
-        df = filter_wallonie(df)
-        col_commune, col_year, col_type, col_median, col_m2, col_tx = detect_columns(df)
+                    evol5 = evolution_pct(series, 5)
+                    evol10 = evolution_pct(series, 10)
 
-        if not col_commune or not col_year:
-            st.error("Schéma open data inattendu: impossible de détecter 'commune' et/ou 'année'.")
-            st.stop()
+                    # Valeur base: médiane commune ajustée surface
+                    base_commune = last_val
+                    surf_adj = 1.0 + clamp((bien["surface_totale"] - 120) / 20.0, -2.0, 3.0) * 0.01
+                    valeur_base = base_commune * surf_adj
+        except Exception:
+            pass
 
-        communes = get_communes_list(df, col_commune)
-        commune_sel = st.selectbox("Commune (pour comparateurs)", communes, index=0 if communes else None)
-        bien["commune"] = commune_sel
-
-        year_latest = latest_year(df, col_year)
-        year_sel = st.selectbox("Année (open data)", sorted(df[col_year].dropna().unique(), reverse=True), index=0)
-        # Filtre commune+année
-        dff = df[(df[col_commune].astype(str).str.strip() == str(commune_sel).strip()) &
-                 (df[col_year].astype(str) == str(year_sel))].copy()
-
-        # On essaye de sortir médian maison/appartement si possible
-        comp = {"ok": False, "year": year_sel}
-
-        def pick_val(d, wanted):
-            if not col_type or not col_median:
-                return None
-            tmp = d[d[col_type].astype(str).str.lower().str.contains(wanted)]
-            if len(tmp) == 0:
-                return None
-            v = pd.to_numeric(tmp[col_median], errors="coerce").dropna()
-            return float(v.iloc[0]) if len(v) else None
-
-        # Heuristiques sur libellés type
-        median_house = pick_val(dff, "maison") or pick_val(dff, "house")
-        median_apartment = pick_val(dff, "appart") or pick_val(dff, "apartment")
-
-        # Si col_median existe mais pas de type -> on prend médiane globale
-        if (median_house is None) and (median_apartment is None) and col_median and len(dff) > 0:
-            v = pd.to_numeric(dff[col_median], errors="coerce").dropna()
-            if len(v):
-                # on met ça en "maison" par défaut
-                median_house = float(v.iloc[0])
-
-        transactions = None
-        if col_tx and len(dff) > 0:
-            tx = pd.to_numeric(dff[col_tx], errors="coerce").dropna()
-            if len(tx):
-                transactions = int(tx.iloc[0])
-
-        comp["median_house"] = median_house or 0
-        comp["median_apartment"] = median_apartment or 0
-        comp["transactions"] = transactions
-        comp["ok"] = True
-
-        a1, a2, a3 = st.columns(3)
-        a1.metric("Prix médian maison (commune)", euro(comp["median_house"]))
-        a2.metric("Prix médian appartement (commune)", euro(comp["median_apartment"]))
-        a3.metric("Transactions (indicatif)", str(comp["transactions"]) if comp["transactions"] is not None else "—")
-
-        st.write("Aperçu des lignes open data filtrées :")
-        st.dataframe(dff.head(20), use_container_width=True)
-
-    except Exception as e:
-        st.error("Impossible de charger l'open data (ODWB). Réessaie plus tard.")
-        st.caption(str(e))
-
-
-# ----------------------------
-# TAB 3: Synthèse + PDF
-# ----------------------------
-with tabs[2]:
-    st.subheader("Estimation expert + valeur locative + PDF vendeur (3 pages)")
-
-    # 1) Comparateurs (si disponibles)
-    comp = {"ok": False, "year": None, "median_house": 0, "median_apartment": 0, "transactions": None}
-    commune_for_report = ""
-
-    try:
-        df = load_odwb_prices_csv()
-        df = filter_wallonie(df)
-        col_commune, col_year, col_type, col_median, col_m2, col_tx = detect_columns(df)
-
-        if col_commune and col_year and "commune" in bien and bien["commune"]:
-            commune_for_report = bien["commune"]
-            y_latest = latest_year(df, col_year)
-            if y_latest is not None:
-                dff = df[(df[col_commune].astype(str).str.strip() == str(commune_for_report).strip()) &
-                         (pd.to_numeric(df[col_year], errors="coerce") == y_latest)].copy()
-
-                def pick_val(d, wanted):
-                    if not col_type or not col_median:
-                        return None
-                    tmp = d[d[col_type].astype(str).str.lower().str.contains(wanted)]
-                    if len(tmp) == 0:
-                        return None
-                    v = pd.to_numeric(tmp[col_median], errors="coerce").dropna()
-                    return float(v.iloc[0]) if len(v) else None
-
-                median_house = pick_val(dff, "maison") or pick_val(dff, "house")
-                median_apartment = pick_val(dff, "appart") or pick_val(dff, "apartment")
-
-                transactions = None
-                if col_tx and len(dff) > 0:
-                    tx = pd.to_numeric(dff[col_tx], errors="coerce").dropna()
-                    if len(tx):
-                        transactions = int(tx.iloc[0])
-
-                comp = {
-                    "ok": True,
-                    "year": y_latest,
-                    "median_house": median_house or 0,
-                    "median_apartment": median_apartment or 0,
-                    "transactions": transactions
-                }
-    except Exception:
-        pass
-
-    # 2) Valeur base (expert simple): médiane commune + ajustement surfaces
-    #    (si pas dispo, on retombe sur une base "surface_totale * 2000" indicative)
-    if type_bien == "Maison" and comp["ok"] and comp["median_house"] > 0:
-        base_commune = comp["median_house"]
-    elif type_bien == "Appartement" and comp["ok"] and comp["median_apartment"] > 0:
-        base_commune = comp["median_apartment"]
-    else:
-        base_commune = bien["surface_totale"] * 2000  # fallback
-
-    # Ajustement surfaces: si surface_totale > 120, +1% par tranche de 20m² (cap)
-    surf_adj = 1.0 + clamp((bien["surface_totale"] - 120) / 20.0, -2.0, 3.0) * 0.01
-    valeur_base = base_commune * surf_adj
-
-    # 3) Terrain auto
+    # Terrain auto
     valeur_terrain = terrain_auto(bien["province"], bien["terrain_m2"], params) if type_bien == "Maison" else 0.0
 
-    # 4) Impacts expert
+    # Impacts
     impacts = {}
     impacts["Humidité"] = impact_humidite(bien["humidite"], params)
     impacts["Année construction"] = impact_annee(bien["annee_construction"], params)
+    impacts["Façades"] = impact_facades(bien["nb_facades"], params)
+
+    impacts["Isolation toiture"] = impact_isolation(bien["isolation_toiture"], params)
+    impacts["Isolation murs"] = impact_isolation(bien["isolation_murs"], params)
+    impacts["Isolation sol"] = impact_isolation(bien["isolation_sol"], params)
+
+    impacts["Cave (surface)"] = impact_cave_surface(bien["surface_cave_m2"], params)
 
     impacts["Maçonnerie/fissures"] = impact_poste(bien["etat_maconnerie"], params)
     impacts["Toiture (poste)"] = impact_poste(bien["etat_toiture_poste"], params)
     impacts["Electricité"] = impact_poste(bien["etat_electricite"], params)
     impacts["Plomberie"] = impact_poste(bien["etat_plomberie"], params)
     impacts["Sols"] = impact_poste(bien["etat_sols"], params)
-    impacts["Façades"] = impact_poste(bien["etat_facades"], params)
+    impacts["Façades (poste)"] = impact_poste(bien["etat_facades"], params)
 
     impacts["Toiture (état)"] = impact_toiture(bien["toiture_etat"], params)
     impacts["Chauffage"] = impact_chauffage(bien["chauffage"], params)
@@ -843,57 +925,71 @@ with tabs[2]:
     impacts["Salle de bain"] = impact_sdb(bien["etat_sdb"], params)
 
     impacts["Chambres"] = impact_chambres(type_bien, bien["chambres"], params)
-    impacts["Salles de bain (nb)"] = impact_sdb_count(bien["sdb"], params)
-    impacts["Annexes (parking/garage/terrasse…)"] = impact_annexes(bien, params)
-
+    impacts["SDB (nb)"] = impact_sdb_count(bien["sdb"], params)
+    impacts["Annexes"] = impact_annexes(bien, params)
     impacts["Equipements"] = impact_equipements(bien["equipements"], params)
 
     total_impacts = sum(impacts.values())
 
-    # 5) Valeur finale
     valeur_tech = valeur_base + valeur_terrain + total_impacts
     coef = float(bien["coef_expert_pct"]) / 100.0
     valeur_finale = valeur_tech * (1.0 + coef)
 
-    # 6) Locatif
-    loyer_mensuel = locatif_mensuel(valeur_finale, type_bien, params)
-
-    # 7) Indice + fourchette
     indice = indice_global(bien)
     low, high, low_pct, high_pct = fourchette(valeur_finale, indice, params)
 
+    loyer_mensuel = locatif_mensuel(valeur_finale, type_bien, params)
+
+    vente_rapide = valeur_finale * (1.0 + float(params["vente_rapide_pct"]))
+    vente_lente = valeur_finale * (1.0 + float(params["vente_lente_pct"]))
+
     # Affichage
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Valeur base (comparateurs)", euro(valeur_base))
-    m2.metric("Valeur terrain auto", euro(valeur_terrain))
-    m3.metric("Total impacts expert", euro(total_impacts))
-    m4.metric("Valeur finale", euro(valeur_finale))
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Valeur base (marché)", euro(valeur_base))
+    k2.metric("Terrain auto", euro(valeur_terrain))
+    k3.metric("Impacts total", euro(total_impacts))
+    k4.metric("Valeur finale", euro(valeur_finale))
 
-    n1, n2, n3 = st.columns(3)
-    n1.metric("Indice global", f"{indice:.1f} / 10")
-    n2.metric("Fourchette basse", euro(low))
-    n3.metric("Fourchette haute", euro(high))
+    x1, x2, x3 = st.columns(3)
+    x1.metric("Fourchette basse", euro(low))
+    x2.metric("Fourchette haute", euro(high))
+    x3.metric("Indice global", f"{indice:.1f} / 10")
 
-    st.metric("Valeur locative mensuelle (indicative)", euro(loyer_mensuel))
+    y1, y2, y3 = st.columns(3)
+    y1.metric("Vente rapide", euro(vente_rapide))
+    y2.metric("Vente lente", euro(vente_lente))
+    y3.metric("Valeur locative / mois", euro(loyer_mensuel))
 
-    with st.expander("Voir impacts (poste par poste)"):
+    if comp["ok"]:
+        st.info(
+            f"Marché open data (commune {bien['commune']}): année {comp['year']} | "
+            f"Evolution 5 ans: {('%.1f' % evol5 + '%') if evol5 is not None else '—'} | "
+            f"Evolution 10 ans: {('%.1f' % evol10 + '%') if evol10 is not None else '—'}"
+        )
+    else:
+        st.warning("Marché open data: pas de donnée trouvée (vérifie la commune / type). L’estimation utilise un fallback.")
+
+    with st.expander("Impacts détaillés"):
         st.dataframe(pd.DataFrame([{"poste": k, "impact": v} for k, v in impacts.items()]), use_container_width=True)
 
     # PDF
-    if "commune" not in bien:
-        bien["commune"] = ""
-
+    client_for_pdf = {"nom": bien["client_nom"], "telephone": bien["client_tel"], "email": bien["client_email"], "notes": bien["client_notes"]}
     pdf = build_pdf(
         bien=bien,
-        comparateurs=comp,
+        client=client_for_pdf,
+        comp=comp,
+        evol5=evol5,
+        evol10=evol10,
         impacts=impacts,
         valeur_base=valeur_base,
         valeur_terrain=valeur_terrain,
         valeur_finale=valeur_finale,
-        loyer_mensuel=loyer_mensuel,
-        indice=indice,
         low=low,
         high=high,
+        loyer_mensuel=loyer_mensuel,
+        vente_rapide=vente_rapide,
+        vente_lente=vente_lente,
+        indice=indice,
         coef_expert_pct=float(bien["coef_expert_pct"]),
         justif=bien["justif_coef"],
     )
@@ -901,40 +997,240 @@ with tabs[2]:
     st.download_button(
         "Télécharger rapport vendeur (PDF - 3 pages)",
         data=pdf,
-        file_name=f"Rapport_Expert_{date.today().isoformat()}.pdf",
+        file_name=f"Rapport_Expert_{today_iso()}.pdf",
         mime="application/pdf",
     )
 
+    st.markdown("---")
+    st.subheader("Enregistrer dans l’historique (CRM)")
 
-# ----------------------------
-# TAB 4: Paramètres
-# ----------------------------
+    # Choix: lier à un client existant ou créer
+    clients_df = st.session_state["clients"]
+    client_id = None
+    if len(clients_df) > 0:
+        options = ["(Créer nouveau client)"] + [f"{row['nom']} • {row['email']} • {row['telephone']} • {row['client_id']}" for _, row in clients_df.iterrows()]
+        pick = st.selectbox("Associer à un client CRM", options, index=0)
+        if pick != "(Créer nouveau client)":
+            client_id = pick.split(" • ")[-1].strip()
+
+    if st.button("Enregistrer estimation + (bien si besoin)"):
+        # 1) client
+        if client_id is None:
+            # créer client à partir des champs
+            nom = safe_text(bien["client_nom"], 80) or "Client"
+            client_id = add_client(nom, safe_text(bien["client_tel"], 40), safe_text(bien["client_email"], 80), safe_text(bien["client_notes"], 200))
+
+        # 2) bien (nouveau bien lié)
+        bien_id = add_bien(
+            client_id=client_id,
+            adresse=bien["adresse"],
+            commune=bien["commune"],
+            province=bien["province"],
+            type_bien=bien["type_bien"],
+            surface_habitable=bien["surface_habitable"],
+            surface_totale=bien["surface_totale"],
+            terrain_m2=bien["terrain_m2"],
+            nb_facades=bien["nb_facades"],
+            peb_lettre=bien["peb_lettre"],
+            peb_kwh=bien["peb_kwh"],
+            statut="Estimation",
+            notes="Créé depuis estimation",
+        )
+
+        # 3) estimation
+        est_row = {
+            "estimation_id": str(uuid.uuid4()),
+            "bien_id": bien_id,
+            "client_id": client_id,
+            "date_estimation": today_iso(),
+            "valeur_base": round(valeur_base, 0),
+            "valeur_terrain": round(valeur_terrain, 0),
+            "total_impacts": round(total_impacts, 0),
+            "coef_expert_pct": float(bien["coef_expert_pct"]),
+            "valeur_finale": round(valeur_finale, 0),
+            "fourchette_basse": round(low, 0),
+            "fourchette_haute": round(high, 0),
+            "vente_rapide": round(vente_rapide, 0),
+            "vente_lente": round(vente_lente, 0),
+            "loyer_mensuel": round(loyer_mensuel, 0),
+            "indice_global": round(indice, 1),
+            "commune_marche": bien["commune"],
+            "annee_marche": comp.get("year", ""),
+            "evol_5ans": evol5 if evol5 is not None else "",
+            "evol_10ans": evol10 if evol10 is not None else "",
+        }
+        add_estimation(est_row)
+        st.success("Enregistré ✅ (client + bien + estimation)")
+
+# =========================
+# 2) Marché & évolution
+# =========================
+with tabs[1]:
+    st.subheader("Marché & évolution (Open Data)")
+
+    if not bien["commune"]:
+        st.info("Encode une commune dans la barre de gauche (ex: Charleroi).")
+    else:
+        try:
+            df = filter_wallonie(load_odwb_prices_csv())
+            col_commune, col_year, col_type, col_median, col_tx = detect_columns(df)
+            if not (col_commune and col_year and col_median):
+                st.error("Open data: colonnes non détectées.")
+            else:
+                want_kw = "maison" if bien["type_bien"] == "Maison" else ("appart" if bien["type_bien"] == "Appartement" else "commerce")
+                series = odwb_series_commune(df, col_commune, col_year, col_type, col_median, bien["commune"], want_kw)
+                if len(series) == 0:
+                    st.warning("Pas de série trouvée pour cette commune/type.")
+                else:
+                    e5 = evolution_pct(series, 5)
+                    e10 = evolution_pct(series, 10)
+
+                    a1, a2, a3 = st.columns(3)
+                    a1.metric("Dernière année", str(int(series["annee"].max())))
+                    a2.metric("Evolution 5 ans", f"{e5:.1f}%" if e5 is not None else "—")
+                    a3.metric("Evolution 10 ans", f"{e10:.1f}%" if e10 is not None else "—")
+
+                    st.line_chart(series.set_index("annee")["prix_median"])
+                    st.dataframe(series, use_container_width=True)
+        except Exception as e:
+            st.error("Erreur chargement marché open data.")
+            st.caption(str(e))
+
+# =========================
+# 3) Historique estimations
+# =========================
+with tabs[2]:
+    st.subheader("Historique des estimations")
+
+    estim = st.session_state["estimations"]
+    biens_df = st.session_state["biens"]
+    clients_df = st.session_state["clients"]
+
+    if len(estim) == 0:
+        st.info("Aucune estimation enregistrée.")
+    else:
+        # jointure simple pour affichage
+        view = estim.merge(biens_df[["bien_id", "adresse", "commune", "type_bien", "statut"]], on="bien_id", how="left")
+        view = view.merge(clients_df[["client_id", "nom", "email", "telephone"]], on="client_id", how="left")
+        view = view.sort_values("date_estimation", ascending=False)
+
+        st.dataframe(view, use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("Modifier statut d’un bien (pipeline)")
+        if len(biens_df) > 0:
+            options = [f"{row['adresse']} • {row['commune']} • {row['type_bien']} • {row['bien_id']}" for _, row in biens_df.iterrows()]
+            pick = st.selectbox("Sélectionner le bien", options)
+            bien_id = pick.split(" • ")[-1].strip()
+            statut = st.selectbox("Nouveau statut", ["Estimation", "Mandat signé", "En vente", "Vendu", "Perdu"], index=0)
+
+            if st.button("Appliquer statut"):
+                mask = st.session_state["biens"]["bien_id"] == bien_id
+                st.session_state["biens"].loc[mask, "statut"] = statut
+                st.success("Statut mis à jour ✅")
+
+# =========================
+# 4) CRM Clients
+# =========================
 with tabs[3]:
-    st.subheader("Paramètres (si tu veux ajuster)")
-    st.caption("Tu peux modifier les impacts (humidité, postes, équipements, rendement locatif, terrain €/m²).")
+    st.subheader("CRM Clients")
 
-    c1, c2 = st.columns(2)
-
+    c1, c2 = st.columns([1, 1])
     with c1:
-        st.write("Terrain €/m² (maisons)")
+        st.markdown("### Ajouter un client")
+        nom = st.text_input("Nom", value="", key="crm_nom")
+        tel = st.text_input("Téléphone", value="", key="crm_tel")
+        email = st.text_input("Email", value="", key="crm_email")
+        notes = st.text_area("Notes", value="", key="crm_notes", height=80)
+        if st.button("Créer client"):
+            cid = add_client(nom or "Client", tel, email, notes)
+            st.success("Client créé ✅")
+
+    with c2:
+        st.markdown("### Clients")
+        st.dataframe(st.session_state["clients"].sort_values("date_creation", ascending=False), use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("### Détails client")
+    if len(st.session_state["clients"]) > 0:
+        options = [f"{row['nom']} • {row['email']} • {row['telephone']} • {row['client_id']}" for _, row in st.session_state["clients"].iterrows()]
+        pick = st.selectbox("Choisir client", options)
+        cid = pick.split(" • ")[-1].strip()
+
+        biens = st.session_state["biens"][st.session_state["biens"]["client_id"] == cid].copy()
+        estim = st.session_state["estimations"][st.session_state["estimations"]["client_id"] == cid].copy()
+
+        st.write("Biens du client:")
+        st.dataframe(biens, use_container_width=True)
+
+        st.write("Estimations du client:")
+        st.dataframe(estim.sort_values("date_estimation", ascending=False), use_container_width=True)
+
+# =========================
+# 5) Fiches biens
+# =========================
+with tabs[4]:
+    st.subheader("Fiches biens")
+
+    biens_df = st.session_state["biens"]
+    clients_df = st.session_state["clients"]
+
+    if len(biens_df) == 0:
+        st.info("Aucun bien enregistré.")
+    else:
+        view = biens_df.merge(clients_df[["client_id", "nom", "email", "telephone"]], on="client_id", how="left")
+        view = view.sort_values("date_creation", ascending=False)
+        st.dataframe(view, use_container_width=True)
+
+# =========================
+# 6) Paramètres / Export
+# =========================
+with tabs[5]:
+    st.subheader("Paramètres")
+    st.caption("Tu peux ajuster les chiffres sans toucher au code.")
+
+    colA, colB = st.columns(2)
+    with colA:
+        st.write("Terrain €/m²")
         params["terrain_Hainaut"] = st.number_input("Hainaut", value=int(params["terrain_Hainaut"]), step=5)
         params["terrain_Namur"] = st.number_input("Namur", value=int(params["terrain_Namur"]), step=5)
         params["terrain_Liege"] = st.number_input("Liège", value=int(params["terrain_Liege"]), step=5)
         params["terrain_Brabant_wallon"] = st.number_input("Brabant wallon", value=int(params["terrain_Brabant_wallon"]), step=5)
         params["terrain_Luxembourg"] = st.number_input("Luxembourg", value=int(params["terrain_Luxembourg"]), step=5)
 
-        st.write("Humidité")
-        params["hum_legere"] = st.number_input("Humidité légère (impact €)", value=int(params["hum_legere"]), step=1000)
-        params["hum_importante"] = st.number_input("Humidité importante (impact €)", value=int(params["hum_importante"]), step=1000)
+        st.write("Vente rapide / lente")
+        params["vente_rapide_pct"] = st.number_input("Vente rapide (%)", value=float(params["vente_rapide_pct"] * 100), step=0.5) / 100.0
+        params["vente_lente_pct"] = st.number_input("Vente lente (%)", value=float(params["vente_lente_pct"] * 100), step=0.5) / 100.0
 
-    with c2:
+    with colB:
         st.write("Rendement brut locatif")
         params["rendement_brut_maison"] = st.number_input("Maison (%)", value=float(params["rendement_brut_maison"] * 100), step=0.1) / 100.0
         params["rendement_brut_appartement"] = st.number_input("Appartement (%)", value=float(params["rendement_brut_appartement"] * 100), step=0.1) / 100.0
         params["rendement_brut_commerce"] = st.number_input("Commerce (%)", value=float(params["rendement_brut_commerce"] * 100), step=0.1) / 100.0
 
-        st.write("Postes (Moyen/Mauvais)")
+        st.write("Postes")
         params["poste_moyen"] = st.number_input("Poste moyen (impact €)", value=int(params["poste_moyen"]), step=1000)
         params["poste_mauvais"] = st.number_input("Poste mauvais (impact €)", value=int(params["poste_mauvais"]), step=1000)
 
     st.session_state["params"] = params
+
+    st.markdown("---")
+    st.subheader("Export / Import (pour garder le CRM et l’historique)")
+    st.caption("Sur Streamlit, la mémoire peut se réinitialiser. Fais un export régulièrement (1 fichier).")
+
+    export_bytes = export_all_to_zip_csv()
+    st.download_button(
+        "Exporter CRM + Biens + Estimations (1 fichier)",
+        data=export_bytes,
+        file_name=f"backup_priorite_immobiliere_{today_iso()}.txt",
+        mime="text/plain",
+    )
+
+    up = st.file_uploader("Importer un export (restaure tout)", type=["txt"])
+    if up is not None:
+        try:
+            import_from_multi_csv(up.read())
+            st.success("Import OK ✅ (CRM + biens + estimations restaurés)")
+        except Exception as e:
+            st.error("Import impossible. Vérifie que c’est bien un export de l’app.")
+            st.caption(str(e))
